@@ -10,6 +10,11 @@ import numpy as np
 
 from engine.pipeline.config_schemas import PintleEngineConfig
 
+# Impinging injector bounds (Layer-1 + feasibility scripts): scale with chamber bore.
+DEFAULT_IMPINGING_WALL_THICKNESS_M = 0.0254
+IMPINGING_JET_PITCH_ESTIMATE_M = 0.004  # heuristic min center-to-center spacing for n_elements ceiling
+IMPINGING_N_ELEMENTS_ABSOLUTE_CAP = 200
+
 
 def extract_all_parameters(config: PintleEngineConfig) -> Dict[str, Any]:
     """Extract all optimized parameters from config."""
@@ -27,6 +32,16 @@ def extract_all_parameters(config: PintleEngineConfig) -> Dict[str, Any]:
             params["n_orifices"] = geometry.lox.n_orifices
             params["d_orifice"] = geometry.lox.d_orifice
             params["theta_orifice"] = geometry.lox.theta_orifice
+    elif hasattr(config, 'injector') and config.injector.type == "impinging":
+        g = config.injector.geometry
+        nd = int(min(int(g.oxidizer.n_elements), int(g.fuel.n_elements)))
+        params["n_doublets"] = nd
+        params["d_jet_oxidizer"] = g.oxidizer.d_jet
+        params["impingement_angle_oxidizer"] = g.oxidizer.impingement_angle
+        params["spacing_oxidizer"] = g.oxidizer.spacing
+        params["d_jet_fuel"] = g.fuel.d_jet
+        params["impingement_angle_fuel"] = g.fuel.impingement_angle
+        params["spacing_fuel"] = g.fuel.spacing
     
     # Chamber parameters
     from engine.pipeline.config_schemas import ensure_chamber_geometry
@@ -58,4 +73,56 @@ def extract_all_parameters(config: PintleEngineConfig) -> Dict[str, Any]:
         params["graphite_enabled"] = False
     
     return params
+
+
+def impinging_chamber_inner_diameter_for_bounds(
+    config: PintleEngineConfig,
+    *,
+    max_chamber_outer_diameter_m: float,
+    wall_thickness_m: float = DEFAULT_IMPINGING_WALL_THICKNESS_M,
+) -> float:
+    """Bore used for impinging packing / n_elements limits.
+
+    Prefer ``chamber_geometry.chamber_diameter``; else frozen outer diameter minus wall;
+    else legacy heuristic ``0.5 * max_od - wall`` (underestimates full-OD designs).
+    """
+    cg = getattr(config, "chamber_geometry", None)
+    if cg is not None:
+        d = getattr(cg, "chamber_diameter", None)
+        if d is not None and float(d) > 0.0:
+            return float(d)
+    dr = getattr(config, "design_requirements", None)
+    if dr is not None:
+        fp = getattr(dr, "frozen_parameters", None)
+        if fp is not None:
+            domm = getattr(fp, "D_chamber_outer_mm", None)
+            if domm is not None and float(domm) > 0.0:
+                return float(domm) * 1e-3 - wall_thickness_m
+    min_outer = float(max_chamber_outer_diameter_m) * 0.5
+    return float(max(min_outer - wall_thickness_m, 0.02))
+
+
+def impinging_n_elements_hi_int(
+    chamber_inner_diameter_m: float,
+    *,
+    pitch_est_m: float = IMPINGING_JET_PITCH_ESTIMATE_M,
+    absolute_cap: int = IMPINGING_N_ELEMENTS_ABSOLUTE_CAP,
+) -> int:
+    """Upper integer count ~ circumference / pitch, capped for optimizer stability."""
+    if chamber_inner_diameter_m <= 0.0:
+        return 12
+    n_circ = int(np.pi * chamber_inner_diameter_m / max(pitch_est_m, 1e-9))
+    return int(max(12, min(absolute_cap, n_circ)))
+
+
+def impinging_d_jet_upper_bound_m(chamber_inner_diameter_m: float) -> float:
+    """Allow larger jets on larger bores; keep 4 mm floor for small chambers."""
+    d = float(chamber_inner_diameter_m)
+    return float(min(0.008, max(0.004, 0.038 * d)))
+
+
+def impinging_spacing_upper_bound_m(chamber_inner_diameter_m: float) -> float:
+    """Wider spacing cap for large injector faces (packing uses π D²/4)."""
+    d = float(chamber_inner_diameter_m)
+    return float(min(0.14, max(0.06, 0.42 * d)))
 

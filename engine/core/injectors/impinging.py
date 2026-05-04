@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Tuple, Dict, Any
 
 import numpy as np
+
+_LOG = logging.getLogger(__name__)
+_print_raw = os.environ.get("ENGINE_PRINT_IMPINGING_FEED_CLOSURE", "")
+_PRINT_FEED_ORIFICE_CLOSURE = _print_raw != "" and str(_print_raw).lower() not in ("0", "false", "no")
+_FEED_ORIFICE_FP_TOL = 1e-6
+_FEED_ORIFICE_FP_MAX_ITER = 150
+_FEED_ORIFICE_CD_INNER_MAX = 120
+_FEED_ORIFICE_CD_INNER_TOL = 1e-12
 
 from engine.pipeline.config_schemas import PintleEngineConfig, ImpingingInjectorConfig
 from engine.pipeline.feed_loss import delta_p_feed
@@ -24,6 +34,10 @@ from engine.core.spray import (
 )
 
 from . import InjectorModel
+from engine.core.injectors.flow_capacity import (
+    effective_flow_areas_from_cd,
+    merge_effective_area_warnings,
+)
 
 
 class ImpingingInjector(InjectorModel):
@@ -62,6 +76,10 @@ class ImpingingInjector(InjectorModel):
         mu_F = fluids["fuel"].viscosity
         sigma_F = fluids["fuel"].surface_tension
 
+        # Inlet temperatures for Cd(Re): match pintle — use fluid properties from config when set
+        T_tank_O = getattr(fluids["oxidizer"], "temperature", 90.0)
+        T_tank_F = getattr(fluids["fuel"], "temperature", 300.0)
+
         A_O = geometry.oxidizer.n_elements * np.pi * (geometry.oxidizer.d_jet / 2.0) ** 2
         A_F = geometry.fuel.n_elements * np.pi * (geometry.fuel.d_jet / 2.0) ** 2
         d_hyd_O = geometry.oxidizer.d_jet
@@ -88,84 +106,237 @@ class ImpingingInjector(InjectorModel):
             "D32_F": None,
             "x_star": None,
             "injector_type": "impinging",
+            "turbulence_intensity_O": None,
+            "turbulence_intensity_F": None,
+            "turbulence_length_O": None,
+            "turbulence_length_F": None,
+            "turbulence_intensity_mix": None,
         }
 
-        imp_angle_rad = np.deg2rad((geometry.oxidizer.impingement_angle + geometry.fuel.impingement_angle) / 2.0)
+        # Typical opposing doublet: each side's ``impingement_angle`` is measured from chamber axis toward
+        # the impingement plane; separation between jet centerlines is θ_O + θ_F (schema: included angle per stream).
+        _imp_sep_deg = float(geometry.oxidizer.impingement_angle + geometry.fuel.impingement_angle)
+        _imp_sep_deg = float(np.clip(_imp_sep_deg, 1.0, 179.0))
+        imp_angle_rad = np.deg2rad(_imp_sep_deg)
 
-        for iteration in range(max_iter):
-            for feed_iter in range(3):
-                delta_p_feed_O = delta_p_feed(mdot_O, rho_O, feed_O, P_tank_O)
-                delta_p_feed_F_base = delta_p_feed(mdot_F, rho_F, feed_F, P_tank_F)
+        def _injector_turbulence_fields(uo: float, uf: float) -> Dict[str, float]:
+            """Same Reynolds-based turbulence model as pintle (shear-layer mixing intensity)."""
+            Re_Oloc = calculate_reynolds_number(rho_O, uo, d_hyd_O, mu_O)
+            Re_Floc = calculate_reynolds_number(rho_F, uf, d_hyd_F, mu_F)
+            ti_O = 0.16 * (Re_Oloc ** -0.125) if Re_Oloc > 0 else 0.1
+            ti_F = 0.16 * (Re_Floc ** -0.125) if Re_Floc > 0 else 0.1
+            ti_O = float(np.clip(ti_O, 0.02, 0.3))
+            ti_F = float(np.clip(ti_F, 0.02, 0.3))
+            tl_O = float(0.07 * d_hyd_O)
+            tl_F = float(0.07 * d_hyd_F)
+            velocity_total = max(uo + uf, 1e-6)
+            ti_mix = (ti_O * uo + ti_F * uf) / velocity_total
+            ti_mix = float(np.clip(ti_mix, 0.02, 0.35))
+            return {
+                "turbulence_intensity_O": ti_O,
+                "turbulence_intensity_F": ti_F,
+                "turbulence_length_O": tl_O,
+                "turbulence_length_F": tl_F,
+                "turbulence_intensity_mix": ti_mix,
+            }
+
+        def _converge_feed_orifice_coupling(
+            mdot_o0: float,
+            mdot_f0: float,
+            cd_eff_o: float,
+            cd_eff_f: float,
+        ) -> Tuple[
+            float,
+            float,
+            float,
+            float,
+            float,
+            float,
+            float,
+            float,
+            float,
+            float,
+            int,
+        ]:
+            """Feed loss ⇄ inlet pressure ⇄ Bernoulli mdot until fixed point (per spray outer iteration).
+
+            Sequential update: Δp_feed(ṁ) → P_inj → Δp_inj → Cd(Re(u)) → ṁ′ = Cd A √(2 ρ Δp_inj).
+
+            Returns
+            -------
+            mdot_o, mdot_f, cd_o, cd_f, Pi_o, Pi_f, dpf_o, dpf_f, dpi_o, dpi_f, fp_iters
+            """
+
+            def _bern_mdot_with_cd_iterate(
+                mdot_seed: float,
+                delta_p_inj: float,
+                Pi_inj: float,
+                rho_i: float,
+                area_i: float,
+                d_hyd_local: float,
+                mu_local: float,
+                discharge_local,
+                Tin: float,
+                cd_cap: float,
+            ) -> Tuple[float, float]:
+                """For fixed inlet head Δp_inj(P_inj,Pc): ṁ = Cd(Re(ṁ)) A √(2ρ Δp_inj) to numerical tolerance."""
+                if delta_p_inj <= 0:
+                    Cd_0 = float(
+                        min(
+                            cd_from_re(0.0, discharge_local, P_inlet=Pi_inj, T_inlet=Tin),
+                            cd_cap,
+                        )
+                    )
+                    return 0.0, Cd_0
+
+                cd_lo = float(
+                    min(
+                        cd_from_re(0.0, discharge_local, P_inlet=Pi_inj, T_inlet=Tin),
+                        cd_cap,
+                    )
+                )
+                m = float(mdot_seed) if mdot_seed > 1e-18 else float(cd_lo * area_i * np.sqrt(2.0 * rho_i * delta_p_inj))
+                Cd_out = cd_lo
+
+                for _cin in range(1, _FEED_ORIFICE_CD_INNER_MAX + 1):
+                    m_was = float(m)
+                    u_loc = m / (rho_i * area_i) if area_i > 0 else 0.0
+                    Re_loc = calculate_reynolds_number(rho_i, u_loc, d_hyd_local, mu_local)
+                    Cd_out = float(
+                        min(
+                            cd_from_re(Re_loc, discharge_local, P_inlet=Pi_inj, T_inlet=Tin),
+                            cd_cap,
+                        )
+                    )
+                    m = float(Cd_out * area_i * np.sqrt(2.0 * rho_i * delta_p_inj))
+                    inn_rel = abs(m - m_was) / max(abs(m_was), 1e-18)
+                    if inn_rel < _FEED_ORIFICE_CD_INNER_TOL:
+                        break
+                    if _cin == _FEED_ORIFICE_CD_INNER_MAX:
+                        _LOG.warning(
+                            "impinging injector: Cd–Bernoulli inner iterations hit "
+                            f"{_FEED_ORIFICE_CD_INNER_MAX}; inn_rel={inn_rel:.3e}"
+                        )
+
+                return float(m), float(Cd_out)
+
+            mo = float(mdot_o0)
+            mf = float(mdot_f0)
+            dpi_o = dpi_f = 0.0
+            dpf_o = dpf_f = 0.0
+            Pi_o = Pi_f = P_tank_O
+            Cdo = Cdf = 0.0
+
+            for fp_it in range(1, _FEED_ORIFICE_FP_MAX_ITER + 1):
+                mo_prev, mf_prev = mo, mf
+
+                dpf_o = delta_p_feed(mo, rho_O, feed_O, P_tank_O)
+                dpf_f_base = delta_p_feed(mf, rho_F, feed_F, P_tank_F)
                 if config.regen_cooling is not None and config.regen_cooling.enabled:
-                    delta_p_regen = delta_p_regen_channels(
-                        mdot_F,
+                    dpf_reg = delta_p_regen_channels(
+                        mf,
                         rho_F,
                         mu_F,
                         config.regen_cooling,
                         P_tank_F,
                     )
-                    delta_p_feed_F = delta_p_feed_F_base + delta_p_regen
+                    dpf_f = dpf_f_base + dpf_reg
                 else:
-                    delta_p_feed_F = delta_p_feed_F_base
+                    dpf_f = dpf_f_base
 
-                # CRITICAL: Calculate injector pressures AFTER feed loss calculation (always, not just in else block)
-                P_inj_O = P_tank_O - delta_p_feed_O
-                P_inj_F = P_tank_F - delta_p_feed_F
+                Pi_o = float(P_tank_O - dpf_o)
+                Pi_f = float(P_tank_F - dpf_f)
+                dpi_o = max(0.0, Pi_o - Pc)
+                dpi_f = max(0.0, Pi_f - Pc)
 
-                if feed_iter < 2:
-                    delta_p_inj_O = max(0.0, P_inj_O - Pc)
-                    delta_p_inj_F = max(0.0, P_inj_F - Pc)
+                if Pi_o < Pc:
+                    mo = 0.0
+                    Cdo = float(min(cd_from_re(0.0, discharge_O, P_inlet=Pi_o, T_inlet=T_tank_O), cd_eff_o))
+                else:
+                    mo, Cdo = _bern_mdot_with_cd_iterate(
+                        mo,
+                        dpi_o,
+                        Pi_o,
+                        rho_O,
+                        A_O,
+                        d_hyd_O,
+                        mu_O,
+                        discharge_O,
+                        T_tank_O,
+                        cd_eff_o,
+                    )
 
-                    u_O_quick = np.sqrt(2 * delta_p_inj_O / rho_O) if delta_p_inj_O > 0 else 0.0
-                    u_F_quick = np.sqrt(2 * delta_p_inj_F / rho_F) if delta_p_inj_F > 0 else 0.0
+                if Pi_f < Pc:
+                    mf = 0.0
+                    Cdf = float(min(cd_from_re(0.0, discharge_F, P_inlet=Pi_f, T_inlet=T_tank_F), cd_eff_f))
+                else:
+                    mf, Cdf = _bern_mdot_with_cd_iterate(
+                        mf,
+                        dpi_f,
+                        Pi_f,
+                        rho_F,
+                        A_F,
+                        d_hyd_F,
+                        mu_F,
+                        discharge_F,
+                        T_tank_F,
+                        cd_eff_f,
+                    )
 
-                    Re_O_quick = calculate_reynolds_number(rho_O, u_O_quick, d_hyd_O, mu_O)
-                    Re_F_quick = calculate_reynolds_number(rho_F, u_F_quick, d_hyd_F, mu_F)
+                # Symmetric relative residual (pure ``|Δ|/|prev|`` blows up when ṁ crosses ~0).
+                den_o = max(abs(mo_prev), abs(mo), 1e-18)
+                den_f = max(abs(mf_prev), abs(mf), 1e-18)
+                rel_o = abs(mo - mo_prev) / den_o
+                rel_f = abs(mf - mf_prev) / den_f
 
-                    T_tank_O = 90.0
-                    T_tank_F = 300.0
-                    Cd_O_quick_base = cd_from_re(Re_O_quick, discharge_O, P_inlet=P_inj_O, T_inlet=T_tank_O)
-                    Cd_F_quick_base = cd_from_re(Re_F_quick, discharge_F, P_inlet=P_inj_F, T_inlet=T_tank_F)
-                    Cd_O_quick = min(Cd_O_quick_base, Cd_O_eff)
-                    Cd_F_quick = min(Cd_F_quick_base, Cd_F_eff)
+                if rel_o < _FEED_ORIFICE_FP_TOL and rel_f < _FEED_ORIFICE_FP_TOL:
+                    break
+                if fp_it == _FEED_ORIFICE_FP_MAX_ITER:
+                    _LOG.warning(
+                        "impinging injector: feed-orifice coupling hit max iterations "
+                        f"({_FEED_ORIFICE_FP_MAX_ITER}); rel errors O={rel_o:.3e} F={rel_f:.3e}"
+                    )
 
-                    mdot_O = Cd_O_quick * A_O * np.sqrt(2 * rho_O * delta_p_inj_O)
-                    mdot_F = Cd_F_quick * A_F * np.sqrt(2 * rho_F * delta_p_inj_F)
+            mdot_bn_o = float(Cdo * A_O * np.sqrt(2.0 * rho_O * dpi_o)) if dpi_o > 0 else 0.0
+            mdot_bn_f = float(Cdf * A_F * np.sqrt(2.0 * rho_F * dpi_f)) if dpi_f > 0 else 0.0
 
-            delta_p_inj_O = max(0.0, P_inj_O - Pc)
-            delta_p_inj_F = max(0.0, P_inj_F - Pc)
+            _LOG.debug(
+                "impinging feed-orifice closure: fp_iters=%d mdot_solver_O=%s mdot_from_Bernoulli_O=%s "
+                "mdot_solver_F=%s mdot_from_Bernoulli_F=%s",
+                fp_it,
+                repr(mo),
+                repr(mdot_bn_o),
+                repr(mf),
+                repr(mdot_bn_f),
+            )
+            if _PRINT_FEED_ORIFICE_CLOSURE:
+                print(
+                    "impinging feed-orifice closure",
+                    f"fp_iters={fp_it}",
+                    f"mdot_solver_O={mo}",
+                    f"mdot_from_Bernoulli_O={mdot_bn_o}",
+                    f"mdot_solver_F={mf}",
+                    f"mdot_from_Bernoulli_F={mdot_bn_f}",
+                )
 
-            if P_inj_O < Pc:
-                mdot_O = 0.0
-            if P_inj_F < Pc:
-                mdot_F = 0.0
+            return mo, mf, Cdo, Cdf, Pi_o, Pi_f, dpf_o, dpf_f, dpi_o, dpi_f, fp_it
 
-            u_O = mdot_O / (rho_O * A_O) if A_O > 0 else 0.0
-            u_F = mdot_F / (rho_F * A_F) if A_F > 0 else 0.0
+        feed_orifice_fp_last = 0
 
-            Re_O = calculate_reynolds_number(rho_O, u_O, d_hyd_O, mu_O)
-            Re_F = calculate_reynolds_number(rho_F, u_F, d_hyd_F, mu_F)
-
-            Cd_O_base = cd_from_re(Re_O, discharge_O, P_inlet=P_inj_O, T_inlet=90.0)
-            Cd_F_base = cd_from_re(Re_F, discharge_F, P_inlet=P_inj_F, T_inlet=300.0)
-            Cd_O = min(Cd_O_base, Cd_O_eff)
-            Cd_F = min(Cd_F_base, Cd_F_eff)
-
-            if delta_p_inj_O > 0:
-                mdot_O = Cd_O * A_O * np.sqrt(2 * rho_O * delta_p_inj_O)
-            else:
-                mdot_O = 0.0
-
-            if delta_p_inj_F > 0:
-                mdot_F = Cd_F * A_F * np.sqrt(2 * rho_F * delta_p_inj_F)
-            else:
-                mdot_F = 0.0
+        for iteration in range(max_iter):
+            mdot_O, mdot_F, Cd_O, Cd_F, P_inj_O, P_inj_F, delta_p_feed_O, delta_p_feed_F, delta_p_inj_O, delta_p_inj_F, feed_orifice_fp_last = _converge_feed_orifice_coupling(
+                mdot_O,
+                mdot_F,
+                Cd_O_eff,
+                Cd_F_eff,
+            )
 
             u_O = mdot_O / (rho_O * A_O) if A_O > 0 else 0.0
             u_F = mdot_F / (rho_F * A_F) if A_F > 0 else 0.0
 
             # Impingement results in sheet velocity roughly the vector sum
             u_sheet = np.sqrt(u_O ** 2 + u_F ** 2 - 2 * u_O * u_F * np.cos(imp_angle_rad))
+            turb_fields = _injector_turbulence_fields(u_O, u_F)
 
             J = momentum_flux_ratio(rho_O, u_O, rho_F, u_F)
             MR = mdot_O / mdot_F if mdot_F > 0 else np.inf
@@ -219,6 +390,10 @@ class ImpingingInjector(InjectorModel):
                     "D32_F": D32_F,
                     "x_star": x_star,
                     "impingement_angle_deg": np.rad2deg(imp_angle_rad),
+                    "V_rel": float(u_sheet),
+                    "breakup_multiplier": 1.0,
+                    "penetration_multiplier": 1.0,
+                    **turb_fields,
                     # Discharge coefficients
                     "Cd_O": float(Cd_O),
                     "Cd_F": float(Cd_F),
@@ -232,5 +407,92 @@ class ImpingingInjector(InjectorModel):
             Cd_F_eff *= Cd_reduction
             Cd_O_eff = max(Cd_O_eff, discharge_O.Cd_min)
             Cd_F_eff = max(Cd_F_eff, discharge_F.Cd_min)
+
+        # Diagnostics must match last feed–orifice coupling (recomputing from ṁ duplicates float path and drifted Cd).
+        delta_p_feed_O_final = float(delta_p_feed_O)
+        delta_p_feed_F_final = float(delta_p_feed_F)
+        P_inj_O_final = float(P_inj_O)
+        P_inj_F_final = float(P_inj_F)
+        delta_p_inj_O_final = float(delta_p_inj_O)
+        delta_p_inj_F_final = float(delta_p_inj_F)
+
+        mdot_from_bernoulli_O = (
+            float(Cd_O * A_O * np.sqrt(2.0 * rho_O * delta_p_inj_O_final))
+            if delta_p_inj_O_final > 0
+            else 0.0
+        )
+        mdot_from_bernoulli_F = (
+            float(Cd_F * A_F * np.sqrt(2.0 * rho_F * delta_p_inj_F_final))
+            if delta_p_inj_F_final > 0
+            else 0.0
+        )
+
+        u_O_final = mdot_O / (rho_O * A_O) if A_O > 0 else 0.0
+        u_F_final = mdot_F / (rho_F * A_F) if A_F > 0 else 0.0
+        u_sheet_final = float(
+            np.sqrt(
+                u_O_final ** 2
+                + u_F_final ** 2
+                - 2 * u_O_final * u_F_final * np.cos(imp_angle_rad)
+            )
+        )
+        turb_final = _injector_turbulence_fields(u_O_final, u_F_final)
+
+        # Momentum-balance metric: v = mdot / (rho * n_elements * A_jet), A_jet = pi*(d_jet/2)^2
+        n_O = max(1, int(geometry.oxidizer.n_elements))
+        n_F = max(1, int(geometry.fuel.n_elements))
+        djo = float(geometry.oxidizer.d_jet)
+        djf = float(geometry.fuel.d_jet)
+        A_jet_O = np.pi * (djo / 2.0) ** 2
+        A_jet_F = np.pi * (djf / 2.0) ** 2
+        denom_O = rho_O * float(n_O) * A_jet_O
+        denom_F = rho_F * float(n_F) * A_jet_F
+        v_O_bulk = mdot_O / denom_O if denom_O > 0 else np.nan
+        v_F_bulk = mdot_F / denom_F if denom_F > 0 else np.nan
+        momentum_ratio_R = np.nan
+        if (
+            rho_O > 0
+            and rho_F > 0
+            and np.isfinite(v_O_bulk)
+            and np.isfinite(v_F_bulk)
+            and v_F_bulk != 0.0
+        ):
+            num_mom = rho_O * v_O_bulk ** 2
+            den_mom = rho_F * v_F_bulk ** 2
+            if den_mom > 0 and num_mom >= 0:
+                momentum_ratio_R = float(np.sqrt(num_mom / den_mom))
+
+        mom_update: Dict[str, Any] = {}
+        if np.isfinite(momentum_ratio_R) and momentum_ratio_R > 0:
+            mom_update["momentum_ratio_R"] = momentum_ratio_R
+
+        diagnostics.update(
+            {
+                # Required by chamber_solver / combustion efficiency (parity with pintle)
+                "u_O": float(u_O_final),
+                "u_F": float(u_F_final),
+                "V_rel": u_sheet_final,
+                **turb_final,
+                "P_injector_O": float(P_inj_O_final),
+                "P_injector_F": float(P_inj_F_final),
+                "delta_p_injector_O": float(delta_p_inj_O_final),
+                "delta_p_injector_F": float(delta_p_inj_F_final),
+                "delta_p_feed_O": float(delta_p_feed_O_final),
+                "delta_p_feed_F": float(delta_p_feed_F_final),
+                "feed_orifice_coupling_iterations": int(feed_orifice_fp_last),
+                "mdot_from_bernoulli_O": float(mdot_from_bernoulli_O),
+                "mdot_from_bernoulli_F": float(mdot_from_bernoulli_F),
+                **mom_update,
+            }
+        )
+
+        # Geometric vs effective flow areas (A_eff = Cd × A_geom); reuse converged Cd_O/Cd_F
+        A_eff_O, A_eff_F, eff_warns = effective_flow_areas_from_cd(diagnostics, A_O, A_F)
+        diagnostics["A_geom_O"] = float(A_O)
+        diagnostics["A_geom_F"] = float(A_F)
+        diagnostics["A_eff_O"] = float(A_eff_O)
+        diagnostics["A_eff_F"] = float(A_eff_F)
+        if eff_warns:
+            merge_effective_area_warnings(diagnostics, eff_warns)
 
         return mdot_O, mdot_F, diagnostics

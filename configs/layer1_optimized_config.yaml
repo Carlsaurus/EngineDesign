@@ -27,36 +27,36 @@ ablative_cooling:
   use_physics_based_blowing: true
 chamber: null
 chamber_geometry:
-  A_exit: 0.008011846660276834
-  A_throat: 0.0017651044249737868
-  Cf: 1.5223402265660735
-  Lstar: 1.2399053967343734
-  chamber_diameter: 0.1270000000006823
-  design_MR: 3.2
+  A_exit: 0.009644121713273475
+  A_throat: 0.0016073535563634561
+  Cf: 1.5782686369314416
+  Lstar: 0.8241596566174771
+  chamber_diameter: 0.13916277040621738
+  design_MR: 2.55
   design_pressure: 2413166.0
   design_thrust: 7000.0
-  exit_diameter: 0.10099999997138025
-  expansion_ratio: 4.539021344527996
-  length: 0.21154129848565129
+  exit_diameter: 0.11081189981034896
+  expansion_ratio: 6.000000233360444
+  length: 0.13316718041654985
   length_contraction: 0.0451
   length_cylindrical: 0.121
   nozzle_efficiency: 0.95
-  volume: 0.002188562502324721
+  volume: 0.0013247159550753868
 combustion:
   cea:
     MR_range:
-    - 2.4
-    - 4.2
+    - 1.0
+    - 2.5
     Pc_range:
     - 1000000.0
     - 9000000.0
-    cache_file: output/cache/cea_cache_LOX_CH4_3D.npz
+    cache_file: output/cache/cea_cache_LOX_Ethanol_3D.npz
     cea_parallel_workers: null
     eps_range:
     - 4.0
     - 15.0
-    expansion_ratio: 4.539021344527996
-    fuel_name: CH4
+    expansion_ratio: 6.000000233360444
+    fuel_name: Ethanol
     n_points: 34
     ox_name: LOX
     use_parallel_cea_build: true
@@ -70,7 +70,7 @@ combustion:
     Ea_hydrogen: 40000.0
     K: 0.15
     Pc_gate: 1000000.0
-    T_star_fuel_cap_K: 500.0
+    T_star_fuel_cap_K: 700.0
     cooling_efficiency_floor: 0.25
     mixture_efficiency_floor: 0.25
     model: exponential
@@ -105,41 +105,41 @@ design_requirements:
   copv_free_volume_m3: null
   feed_stability_min: 0.15
   frozen_parameters:
-    A_throat_mm2: 1765.1044259737316
-    D_chamber_outer_mm: 152.4
-    Lstar_mm: 1239.905396733828
+    A_throat_mm2: null
+    D_chamber_outer_mm: null
+    Lstar_mm: null
     P_F_start_psi: null
     P_O_start_psi: null
-    d_orifice_mm: 2.7200373856119215
-    d_pintle_tip_mm: 28.2530270113081
-    expansion_ratio: 4.539021344528996
+    d_orifice_mm: null
+    d_pintle_tip_mm: null
+    expansion_ratio: null
     h_gap_mm: 0.5
-    n_orifices: 14
+    n_orifices: null
   fuel_tank_capacity_kg: null
   lox_tank_capacity_kg: null
   max_Lstar: 1.5
   max_P_tank_F: null
   max_P_tank_O: null
-  max_chamber_outer_diameter: 0.1397
+  max_chamber_outer_diameter: 0.177
   max_engine_length: 0.4
-  max_fuel_tank_pressure_psi: 1200.0
-  max_lox_tank_pressure_psi: 700.0
-  max_nozzle_exit_diameter: 0.101
-  min_Lstar: 0.95
+  max_fuel_tank_pressure_psi: 650.0
+  max_lox_tank_pressure_psi: 650.0
+  max_nozzle_exit_diameter: 0.177
+  min_Lstar: 0.76
   min_stability_margin: 1.2
   min_stability_score: 0.75
-  optimal_of_ratio: 3.2
+  optimal_of_ratio: 3.5
   require_stable_state: true
   stability_margin_handicap: 0.0
   target_apogee: 3048.0
   target_burn_time: 6.0
-  target_thrust: 4000.0
+  target_thrust: 8000.0
 discharge:
   fuel:
-    Cd_inf: 0.3
+    Cd_inf: 0.65
     Cd_min: 0.2
     P_ref: 5000000.0
-    T_ref: 112.0
+    T_ref: 300.0
     a_P: 0.0
     a_Re: 0.2
     a_T: 0.0
@@ -196,17 +196,17 @@ film_cooling:
   turbulence_sensitivity: 1.0
 fluids:
   fuel:
-    boiling_point: 111.65
-    density: 422.6
-    latent_heat: 510000.0
-    molecular_weight: 16.04
-    name: Methane
-    specific_heat: 3348.0
-    surface_tension: 0.0134
-    temperature: 112.0
-    thermal_conductivity: 0.204
-    vapor_pressure: 101325.0
-    viscosity: 0.00012
+    boiling_point: 351.4
+    density: 789.0
+    latent_heat: 838000.0
+    molecular_weight: 46.07
+    name: Ethanol
+    specific_heat: 2440.0
+    surface_tension: 0.0223
+    temperature: 293.0
+    thermal_conductivity: 0.17
+    vapor_pressure: 5800.0
+    viscosity: 0.0012
   oxidizer:
     boiling_point: null
     density: 1140.0
@@ -221,7 +221,7 @@ fluids:
     viscosity: 0.00018
 fuel_tank:
   fuel_tank_pos: 3.0
-  initial_pressure_psi: 780.0000001788105
+  initial_pressure_psi: 552.4997456397427
   mass: 7.0
   rp1_h: 0.609
   rp1_radius: 0.0762
@@ -265,20 +265,20 @@ graphite_insert:
 injector:
   geometry:
     fuel:
-      A_entry: 0.0006269311526226677
-      d_hydraulic: 0.0010000000019972565
-      d_pintle_tip: 0.028253027012084497
-      d_reservoir_inner: 0.029253027014081754
-      h_gap: 0.0005000000009986283
+      A_entry: 0.0004148602897700098
+      d_hydraulic: 0.001000000000983636
+      d_pintle_tip: 0.022982961655875968
+      d_reservoir_inner: 0.023982961656859605
+      h_gap: 0.000500000000491818
     lox:
-      A_entry: 5.810849508963446e-06
-      d_hydraulic: 0.0027200373863822463
-      d_orifice: 0.0027200373863822463
+      A_entry: 1.2419141167321206e-05
+      d_hydraulic: 0.003976498666651577
+      d_orifice: 0.003976498666651577
       n_orifices: 14
       theta_orifice: 90.0
   type: pintle
 lox_tank:
-  initial_pressure_psi: 496.87110787450285
+  initial_pressure_psi: 552.4998502724275
   lox_h: 1.14
   lox_radius: 0.06985
   mass: 6.75

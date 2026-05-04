@@ -6,7 +6,7 @@ ablative_cooling:
   char_layer_conductivity: 0.2
   char_layer_thickness: 0.001
   coverage_fraction: 0.9
-  enabled: true
+  enabled: false
   heat_of_ablation: 2500000.0
   initial_thickness: 0.008
   material_density: 1600.0
@@ -110,11 +110,11 @@ design_requirements:
     Lstar_mm: 1239.905396733828
     P_F_start_psi: null
     P_O_start_psi: null
-    d_orifice_mm: 2.7200373856119215
-    d_pintle_tip_mm: 28.2530270113081
+    d_orifice_mm: null
+    d_pintle_tip_mm: null
     expansion_ratio: 4.539021344528996
-    h_gap_mm: 0.5
-    n_orifices: 14
+    h_gap_mm: null
+    n_orifices: null
   fuel_tank_capacity_kg: null
   lox_tank_capacity_kg: null
   max_Lstar: 1.5
@@ -235,7 +235,7 @@ graphite_insert:
   char_layer_thickness: 0.0005
   coverage_fraction: 1.0
   emissivity: 0.8
-  enabled: true
+  enabled: false
   feedback_fraction_max: 0.2
   feedback_fraction_min: 0.0
   friction_coefficient_override: null
@@ -263,20 +263,18 @@ graphite_insert:
   surface_temperature_limit: 2500.0
   thermal_conductivity: 100.0
 injector:
+  type: impinging
   geometry:
+    oxidizer:
+      n_elements: 12
+      d_jet: 0.003
+      impingement_angle: 45.0
+      spacing: 0.012
     fuel:
-      A_entry: 0.0006269311526226677
-      d_hydraulic: 0.0010000000019972565
-      d_pintle_tip: 0.028253027012084497
-      d_reservoir_inner: 0.029253027014081754
-      h_gap: 0.0005000000009986283
-    lox:
-      A_entry: 5.810849508963446e-06
-      d_hydraulic: 0.0027200373863822463
-      d_orifice: 0.0027200373863822463
-      n_orifices: 14
-      theta_orifice: 90.0
-  type: pintle
+      n_elements: 10
+      d_jet: 0.0033
+      impingement_angle: 45.0
+      spacing: 0.011
 lox_tank:
   initial_pressure_psi: 496.87110787450285
   lox_h: 1.14
@@ -286,22 +284,7 @@ lox_tank:
   tank_volume_m3: 0.017474
 nozzle: null
 optimizer:
-  hybrid:
-    block_method: corr_greedy
-    cycles: 3
-    elite_k: 50
-    lambda0: 0.001
-    lambda_max: 1.0
-    lambda_mult: 10.0
-    lambda_normalize: true
-    num_blocks: 3
-    num_tracks: 1
-    overlap_fraction: 0.0
-    per_block_budget_fraction: 0.5
-    refresh_budget_fraction: 0.1
-    refresh_every_pass: true
-    refresh_sigma_scale: 0.2
-  mode: hybrid_cma_blocks
+  mode: cma
 press_tank:
   dry_mass: null
   free_volume_L: 4.5

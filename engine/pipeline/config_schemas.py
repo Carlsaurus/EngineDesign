@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from typing import Literal, Optional, Union, List, Dict, Tuple, Set
 import numpy as np
 
@@ -781,11 +781,178 @@ class DesignRequirementsConfig(BaseModel):
     copv_free_volume_L: Optional[float] = Field(default=4.5, gt=0, description="COPV free internal volume [L]")
     copv_free_volume_m3: Optional[float] = Field(default=None, gt=0, description="COPV free volume [m³] (auto-converted from L if None)")
     
+    # Injector ΔP_inj / Pc soft penalty bands (Layer 1); quadratic hinge outside each interval
+    injector_dp_ratio_O_min: float = Field(
+        default=0.20,
+        ge=0.0,
+        description="Preferred lower edge for oxidizer ΔP_inj/Pc (soft hinge)",
+    )
+    injector_dp_ratio_O_max: float = Field(
+        default=0.35,
+        gt=0.0,
+        description="Preferred upper edge for oxidizer ΔP_inj/Pc (soft hinge)",
+    )
+    injector_dp_ratio_F_min: float = Field(
+        default=0.50,
+        ge=0.0,
+        description="Preferred lower edge for fuel ΔP_inj/Pc (soft hinge)",
+    )
+    injector_dp_ratio_F_max: float = Field(
+        default=1.20,
+        gt=0.0,
+        description="Preferred upper edge for fuel ΔP_inj/Pc (soft hinge)",
+    )
+    W_geom_ao_af_momentum: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Layer 1 impinging-only: weight × (relative error)² steering A_geom_O/A_geom_F toward "
+            "MR/√(ρ_O/ρ_F) (consistent with R≈1 for bulk velocities). 0 disables."
+        ),
+    )
+    # Layer 1 impinging-only (optional overrides; omit or null to use optimizer code defaults).
+    W_MOM: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Weight on momentum_ratio_R quadratic hinge relative to bands below "
+            "(default in layer1_static_optimization.py is 75 when unset)."
+        ),
+    )
+    impinging_momentum_R_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Preferred lower edge for momentum_ratio_R hinge R (impinging-only). None disables.",
+    )
+    impinging_momentum_R_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Preferred upper edge for momentum_ratio_R hinge.",
+    )
+    layer1_impinging_n_doublets_max: Optional[int] = Field(
+        default=None,
+        ge=5,
+        description=(
+            "Layer 1 impinging: max paired LOX/fuel element count (n_doublets). "
+            "The bore-derived ceiling from ``impinging_n_elements_hi_int`` is clipped to this value when set."
+        ),
+    )
+    layer1_random_seed: Optional[int] = Field(
+        default=None,
+        description=(
+            "Layer 1 integer seed for NumPy restart perturbations and CMA-ES ``seed`` "
+            "(each restart uses seed + restart_index × 1_000_003). Omit or null → base 42."
+        ),
+    )
+    W_DP: Optional[float] = Field(default=None, ge=0.0, description="Layer 1 fallback injector ΔP weight.")
+    W_DP_O: Optional[float] = Field(default=None, ge=0.0, description="Layer 1 oxidizer stream ΔP hinge weight.")
+    W_DP_F: Optional[float] = Field(default=None, ge=0.0, description="Layer 1 fuel stream ΔP hinge weight.")
+    layer1_infeasibility_gate_eps: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Treat infeasibility_score ≤ eps as feasible for thrust/MR/ΔP objective blending.",
+    )
+    layer1_W_THRUST: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Layer 1 weight on thrust penalty term (code default 1e4 when unset).",
+    )
+    layer1_W_OF: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Layer 1 weight on relative MR error squared (code default 1e4 when unset).",
+    )
+    layer1_W_OF_low_MR_scale: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "When MR is below optimal_of_ratio, multiply the O/F penalty by max(1, this scale) "
+            "(default 1: no extra weight on fuel-rich side)."
+        ),
+    )
+    layer1_W_OF_high_MR_scale: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "When MR exceeds optimal_of_ratio, multiply the O/F penalty by max(1, this scale) "
+            "(default 1: symmetric with low‑MR tuning optional)."
+        ),
+    )
+    layer1_of_validation_tol: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Relative MR error cap used for Layer‑1 bookkeeping and for ``pressure_candidate_valid`` "
+            "O/F gate (default 0.15)."
+        ),
+    )
+    layer1_thrust_validation_rel_tol: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Relative thrust error gate for ``pressure_candidate_valid``. "
+            "If unset, uses ``tolerances['thrust']`` passed into ``run_layer1_optimization`` (default 10%)."
+        ),
+    )
+
+    layer1_stagnation_pressure_frac_min: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Layer 1 search-box lower edge as a fraction of each tank cap: "
+            "P_O ∈ [max_lox×f_min, max_lox×f_max], P_F similarly (unless overridden below). "
+            "Default when unset: 0.65."
+        ),
+    )
+    layer1_stagnation_pressure_frac_max: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Companion upper fraction for stagnation-pressure box (default when unset: 0.85).",
+    )
+    layer1_P_O_start_psi_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional absolute LOX stagnation pressure lower bound [psi] for Layer 1 (overrides frac box).",
+    )
+    layer1_P_O_start_psi_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional absolute LOX stagnation upper bound [psi].",
+    )
+    layer1_P_F_start_psi_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional fuel stagnation lower bound [psi].",
+    )
+    layer1_P_F_start_psi_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional fuel stagnation upper bound [psi].",
+    )
+
     # Frozen parameters (optional - for locking specific values during optimization)
     frozen_parameters: Optional[FrozenParametersConfig] = Field(
         default=None,
         description="Optional frozen parameter values for Layer 1 optimization. When set, these values are used instead of being optimized."
     )
+
+    @model_validator(mode="after")
+    def _injector_dp_bands_ordered(self):
+        if self.injector_dp_ratio_O_max <= self.injector_dp_ratio_O_min:
+            raise ValueError("injector_dp_ratio_O_max must exceed injector_dp_ratio_O_min")
+        if self.injector_dp_ratio_F_max <= self.injector_dp_ratio_F_min:
+            raise ValueError("injector_dp_ratio_F_max must exceed injector_dp_ratio_F_min")
+        rlo, rhi = self.impinging_momentum_R_min, self.impinging_momentum_R_max
+        if (rlo is not None) ^ (rhi is not None):
+            raise ValueError("Set both impinging_momentum_R_min and impinging_momentum_R_max or neither.")
+        if rlo is not None and rhi is not None and float(rhi) <= float(rlo):
+            raise ValueError("impinging_momentum_R_max must exceed impinging_momentum_R_min.")
+        fmn, fmx = self.layer1_stagnation_pressure_frac_min, self.layer1_stagnation_pressure_frac_max
+        if fmn is not None and fmx is not None and float(fmx) <= float(fmn):
+            raise ValueError("layer1_stagnation_pressure_frac_max must exceed layer1_stagnation_pressure_frac_min.")
+        return self
 
 
 class HybridOptimizerConfig(BaseModel):
@@ -884,6 +1051,39 @@ class PintleEngineConfig(BaseModel):
         if "oxidizer" not in v or "fuel" not in v:
             raise ValueError("Must specify both 'oxidizer' and 'fuel' branches")
         return v
+
+    @model_validator(mode="after")
+    def align_expansion_ratio_with_exit_throat_areas(self):
+        """Nozzle thrust uses eps == A_exit/A_throat (strict); YAML often labels eps rounded."""
+        cg = self.chamber_geometry
+        if cg is None:
+            return self
+        at = cg.A_throat
+        ae = cg.A_exit
+        if at is None or ae is None:
+            return self
+        try:
+            at_f = float(at)
+            ae_f = float(ae)
+        except (TypeError, ValueError):
+            return self
+        if not np.isfinite(at_f) or not np.isfinite(ae_f) or at_f <= 0 or ae_f <= 0:
+            return self
+        eps_geo = ae_f / at_f
+        if eps_geo <= 1.0:
+            return self
+        cg.expansion_ratio = float(eps_geo)
+        try:
+            self.combustion.cea.expansion_ratio = float(eps_geo)
+        except Exception:
+            pass
+        nz = self.nozzle
+        if nz is not None:
+            try:
+                nz.expansion_ratio = float(eps_geo)
+            except Exception:
+                pass
+        return self
 
     class Config:
         extra = "allow"  # Reject unknown fields
