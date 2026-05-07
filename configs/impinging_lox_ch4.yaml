@@ -59,7 +59,7 @@ combustion:
     fuel_name: CH4
     n_points: 34
     ox_name: LOX
-    use_parallel_cea_build: true
+    use_parallel_cea_build: false
   efficiency:
     A0_ethanol: 50000000.0
     A0_hydrocarbon: 10000000.0

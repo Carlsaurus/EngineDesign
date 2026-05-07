@@ -19,6 +19,9 @@ IMPINGING_N_ELEMENTS_ABSOLUTE_CAP = 200
 def extract_all_parameters(config: PintleEngineConfig) -> Dict[str, Any]:
     """Extract all optimized parameters from config."""
     params = {}
+    injector_type = getattr(getattr(config, "injector", None), "type", None)
+    if injector_type is not None:
+        params["injector_type"] = injector_type
     
     # Injector parameters
     if hasattr(config, 'injector') and config.injector.type == "pintle":
@@ -36,6 +39,16 @@ def extract_all_parameters(config: PintleEngineConfig) -> Dict[str, Any]:
         g = config.injector.geometry
         nd = int(min(int(g.oxidizer.n_elements), int(g.fuel.n_elements)))
         params["n_doublets"] = nd
+        # Canonical frontend keys for impinging geometry
+        params["n_elements_O"] = int(g.oxidizer.n_elements)
+        params["d_jet_O"] = g.oxidizer.d_jet
+        params["imp_angle_O"] = g.oxidizer.impingement_angle
+        params["spacing_O"] = g.oxidizer.spacing
+        params["n_elements_F"] = int(g.fuel.n_elements)
+        params["d_jet_F"] = g.fuel.d_jet
+        params["imp_angle_F"] = g.fuel.impingement_angle
+        params["spacing_F"] = g.fuel.spacing
+        # Backward-compatible aliases used by older views/scripts.
         params["d_jet_oxidizer"] = g.oxidizer.d_jet
         params["impingement_angle_oxidizer"] = g.oxidizer.impingement_angle
         params["spacing_oxidizer"] = g.oxidizer.spacing

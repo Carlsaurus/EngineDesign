@@ -5,6 +5,7 @@ import os
 import re
 import json
 import sys
+import threading
 import logging
 from typing import Tuple, Optional, List, Dict, Any
 from multiprocessing import Pool, cpu_count, Manager
@@ -447,6 +448,20 @@ class CEACache:
         
         # Only parallelize if explicitly enabled and for large grids
         should_use_parallel = use_parallel and total_points > 100
+
+        # macOS / Python: multiprocessing.Manager()/Pool started from a *non-main* thread
+        # (e.g. FastAPI Layer‑1 optimizer via ThreadPoolExecutor) often raises
+        # ``OSError: [Errno 1] Operation not permitted``. Sequential build avoids that.
+        if (
+            should_use_parallel
+            and sys.platform == "darwin"
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            print(
+                "   [WARNING] macOS + background thread: disabling parallel CEA build "
+                "(avoids multiprocessing OSError errno 1); using sequential cache build."
+            )
+            should_use_parallel = False
         
         if should_use_parallel and not is_windows:
             # Linux/Mac: use parallel processing with lock (serialized RocketCEA calls)

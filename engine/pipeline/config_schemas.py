@@ -296,6 +296,18 @@ class SMDConfig(BaseModel):
     C: float = Field(default=0.5, gt=0, description="Lefebvre constant C")
     m: float = Field(default=0.6, gt=0, description="Lefebvre exponent m")
     p: float = Field(default=0.0, description="Lefebvre exponent p")
+    we_corr_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Optional cap applied to the liquid Weber number **only** when evaluating the "
+            "Lefebvre-style ``smd_lefebvre`` correlation (D32). Full We is still used for "
+            "``check_spray_constraints``. Jet-like impingement can produce enormous We with "
+            "liquid ρ and mm jets, which drives D32 to sub-micron values outside the correlation's "
+            "useful regime; capping We_corr is a pragmatic surrogate for secondary breakup / "
+            "turbulence limits. Default None = no cap."
+        ),
+    )
 
 
 class EvaporationConfig(BaseModel):
@@ -450,6 +462,16 @@ class CombustionEfficiencyConfig(BaseModel):
         default=0.8,
         ge=0,
         description="Pressure exponent for kinetics scaling: tau_chem ~ (P_ref/Pc)^n. Default 0.8."
+    )
+    tau_Tc_floor_K: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional floor applied to CEA chamber temperature when evaluating the global τ_chem scaling "
+            "in ``calculate_reaction_time_scale`` (finite-rate η_kinetics path). "
+            "CEA equilibrium Tc can be artificially low for some propellant/MR/Pc combinations, which "
+            "blows up the Arrhenius-like temperature factor and makes η_kinetics unrealistically small. "
+            "When set, uses Tc_eff = max(Tc, tau_Tc_floor_K) only for τ_chem (not for equilibrium properties)."
+        ),
     )
     # Gasification model transition temperature
     T_star_fuel_cap_K: float = Field(
@@ -783,22 +805,22 @@ class DesignRequirementsConfig(BaseModel):
     
     # Injector ΔP_inj / Pc soft penalty bands (Layer 1); quadratic hinge outside each interval
     injector_dp_ratio_O_min: float = Field(
-        default=0.20,
+        default=0.15,
         ge=0.0,
         description="Preferred lower edge for oxidizer ΔP_inj/Pc (soft hinge)",
     )
     injector_dp_ratio_O_max: float = Field(
-        default=0.35,
+        default=0.40,
         gt=0.0,
         description="Preferred upper edge for oxidizer ΔP_inj/Pc (soft hinge)",
     )
     injector_dp_ratio_F_min: float = Field(
-        default=0.50,
+        default=0.15,
         ge=0.0,
         description="Preferred lower edge for fuel ΔP_inj/Pc (soft hinge)",
     )
     injector_dp_ratio_F_max: float = Field(
-        default=1.20,
+        default=0.40,
         gt=0.0,
         description="Preferred upper edge for fuel ΔP_inj/Pc (soft hinge)",
     )
@@ -828,6 +850,26 @@ class DesignRequirementsConfig(BaseModel):
         default=None,
         gt=0.0,
         description="Preferred upper edge for momentum_ratio_R hinge.",
+    )
+    layer1_impinging_angle_deg_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        lt=180.0,
+        description="Preferred lower edge for effective impingement angle hinge [deg] (impinging-only).",
+    )
+    layer1_impinging_angle_deg_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        lt=180.0,
+        description="Preferred upper edge for effective impingement angle hinge [deg] (impinging-only).",
+    )
+    W_IMPINGING_ANGLE: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Layer 1 impinging-only weight on effective impingement angle hinge term "
+            "(uses layer1_impinging_angle_deg_min/max when both are set)."
+        ),
     )
     layer1_impinging_n_doublets_max: Optional[int] = Field(
         default=None,
@@ -894,6 +936,31 @@ class DesignRequirementsConfig(BaseModel):
             "If unset, uses ``tolerances['thrust']`` passed into ``run_layer1_optimization`` (default 10%)."
         ),
     )
+    W_CHAMBER_SHAPE: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Layer 1 weight on chamber-shape regularization (D_chamber/D_throat and L_chamber/D_chamber).",
+    )
+    layer1_chamber_dt_ratio_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Preferred lower bound for chamber-to-throat diameter ratio D_chamber_inner/D_throat.",
+    )
+    layer1_chamber_dt_ratio_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Preferred upper bound for chamber-to-throat diameter ratio D_chamber_inner/D_throat.",
+    )
+    layer1_chamber_ld_ratio_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Preferred lower bound for chamber length ratio L_chamber/D_chamber_inner.",
+    )
+    layer1_chamber_ld_ratio_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Preferred upper bound for chamber length ratio L_chamber/D_chamber_inner.",
+    )
 
     layer1_stagnation_pressure_frac_min: Optional[float] = Field(
         default=None,
@@ -910,6 +977,16 @@ class DesignRequirementsConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description="Companion upper fraction for stagnation-pressure box (default when unset: 0.85).",
+    )
+    layer1_expansion_ratio_min: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional lower bound for Layer 1 expansion-ratio search box (default when unset: 4.0).",
+    )
+    layer1_expansion_ratio_max: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Optional upper bound for Layer 1 expansion-ratio search box (default when unset: 12.0).",
     )
     layer1_P_O_start_psi_min: Optional[float] = Field(
         default=None,
@@ -949,9 +1026,27 @@ class DesignRequirementsConfig(BaseModel):
             raise ValueError("Set both impinging_momentum_R_min and impinging_momentum_R_max or neither.")
         if rlo is not None and rhi is not None and float(rhi) <= float(rlo):
             raise ValueError("impinging_momentum_R_max must exceed impinging_momentum_R_min.")
+        alo, ahi = self.layer1_impinging_angle_deg_min, self.layer1_impinging_angle_deg_max
+        if (alo is not None) ^ (ahi is not None):
+            raise ValueError("Set both layer1_impinging_angle_deg_min and layer1_impinging_angle_deg_max or neither.")
+        if alo is not None and ahi is not None and float(ahi) <= float(alo):
+            raise ValueError("layer1_impinging_angle_deg_max must exceed layer1_impinging_angle_deg_min.")
         fmn, fmx = self.layer1_stagnation_pressure_frac_min, self.layer1_stagnation_pressure_frac_max
         if fmn is not None and fmx is not None and float(fmx) <= float(fmn):
             raise ValueError("layer1_stagnation_pressure_frac_max must exceed layer1_stagnation_pressure_frac_min.")
+        ermn, ermx = self.layer1_expansion_ratio_min, self.layer1_expansion_ratio_max
+        if ermn is not None and ermx is not None and float(ermx) <= float(ermn):
+            raise ValueError("layer1_expansion_ratio_max must exceed layer1_expansion_ratio_min.")
+        dtr_lo, dtr_hi = self.layer1_chamber_dt_ratio_min, self.layer1_chamber_dt_ratio_max
+        if (dtr_lo is not None) ^ (dtr_hi is not None):
+            raise ValueError("Set both layer1_chamber_dt_ratio_min and layer1_chamber_dt_ratio_max or neither.")
+        if dtr_lo is not None and dtr_hi is not None and float(dtr_hi) <= float(dtr_lo):
+            raise ValueError("layer1_chamber_dt_ratio_max must exceed layer1_chamber_dt_ratio_min.")
+        ldr_lo, ldr_hi = self.layer1_chamber_ld_ratio_min, self.layer1_chamber_ld_ratio_max
+        if (ldr_lo is not None) ^ (ldr_hi is not None):
+            raise ValueError("Set both layer1_chamber_ld_ratio_min and layer1_chamber_ld_ratio_max or neither.")
+        if ldr_lo is not None and ldr_hi is not None and float(ldr_hi) <= float(ldr_lo):
+            raise ValueError("layer1_chamber_ld_ratio_max must exceed layer1_chamber_ld_ratio_min.")
         return self
 
 

@@ -61,7 +61,7 @@ combustion:
     fuel_name: CH4
     n_points: 34
     ox_name: LOX
-    use_parallel_cea_build: true
+    use_parallel_cea_build: false
   efficiency:
     A0_ethanol: 50000000.0
     A0_hydrocarbon: 10000000.0
@@ -206,10 +206,11 @@ feed_system:
     d_inlet: 0.009525
     phi_type: none
   oxidizer:
-    A_hydraulic: 7.13e-05
+    # Dual balanced parallel 3/8" LOX feeds (effective area doubles vs single line)
+    A_hydraulic: 1.425115e-4
     K0: 2.0
     K1: 0.0
-    d_inlet: 0.009525
+    d_inlet: 0.01347035
     phi_type: none
 film_cooling:
   apply_to_fraction_of_length: 0.6
@@ -501,6 +502,9 @@ spray:
     m: 0.6
     model: lefebvre
     p: 0.0
+    # Liquid We with mm jets can exceed the Lefebvre correlation's useful regime (sub-µm D32).
+    # Cap Weber **only** for D32 evaluation; spray We constraints still use the uncapped values.
+    we_corr_max: 220.0
   spray_angle:
     k: 0.5
     model: TMR

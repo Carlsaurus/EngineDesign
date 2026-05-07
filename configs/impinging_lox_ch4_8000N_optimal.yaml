@@ -44,8 +44,10 @@ feed_system:
     K1: 0.0
     phi_type: none
   oxidizer:
-    d_inlet: 0.009525
-    A_hydraulic: 7.13e-05
+    # Dual balanced parallel 3/8" runs: A_eff = 2 × A(3/8") ⇒ d_eq = √2 × 0.009525 m
+    # (see engine.pipeline.constants FEED_LINE_DUAL_3_8_*)
+    d_inlet: 0.01347035
+    A_hydraulic: 1.425115e-4
     K0: 2.0
     K1: 0.0
     phi_type: none
@@ -211,7 +213,7 @@ spray:
   turbulence_penetration_gain: 0.5
 combustion:
   cea:
-    use_parallel_cea_build: true
+    use_parallel_cea_build: false
     cea_parallel_workers: null
     ox_name: LOX
     fuel_name: CH4

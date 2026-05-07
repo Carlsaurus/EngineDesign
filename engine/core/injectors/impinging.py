@@ -15,6 +15,9 @@ _FEED_ORIFICE_FP_TOL = 1e-6
 _FEED_ORIFICE_FP_MAX_ITER = 150
 _FEED_ORIFICE_CD_INNER_MAX = 120
 _FEED_ORIFICE_CD_INNER_TOL = 1e-12
+# Under-relaxation for the feed-loss ⇄ Bernoulli fixed point. A full Gauss–Seidel step can limit-cycle
+# when quadratic feed losses interact with choked-orifice flow (seen in ``impinging_smoke``).
+_FEED_ORIFICE_RELAX = 0.35
 
 from engine.pipeline.config_schemas import PintleEngineConfig, ImpingingInjectorConfig
 from engine.pipeline.feed_loss import delta_p_feed
@@ -250,10 +253,10 @@ class ImpingingInjector(InjectorModel):
                 dpi_f = max(0.0, Pi_f - Pc)
 
                 if Pi_o < Pc:
-                    mo = 0.0
+                    mo_new = 0.0
                     Cdo = float(min(cd_from_re(0.0, discharge_O, P_inlet=Pi_o, T_inlet=T_tank_O), cd_eff_o))
                 else:
-                    mo, Cdo = _bern_mdot_with_cd_iterate(
+                    mo_new, Cdo = _bern_mdot_with_cd_iterate(
                         mo,
                         dpi_o,
                         Pi_o,
@@ -267,10 +270,10 @@ class ImpingingInjector(InjectorModel):
                     )
 
                 if Pi_f < Pc:
-                    mf = 0.0
+                    mf_new = 0.0
                     Cdf = float(min(cd_from_re(0.0, discharge_F, P_inlet=Pi_f, T_inlet=T_tank_F), cd_eff_f))
                 else:
-                    mf, Cdf = _bern_mdot_with_cd_iterate(
+                    mf_new, Cdf = _bern_mdot_with_cd_iterate(
                         mf,
                         dpi_f,
                         Pi_f,
@@ -282,6 +285,43 @@ class ImpingingInjector(InjectorModel):
                         T_tank_F,
                         cd_eff_f,
                     )
+
+                w = float(_FEED_ORIFICE_RELAX)
+                if not (np.isfinite(w) and 0.0 < w <= 1.0):
+                    w = 0.35
+                mo = float(mo_prev + w * (mo_new - mo_prev))
+                mf = float(mf_prev + w * (mf_new - mf_prev))
+
+                # Consistent feed/injector heads at the relaxed iterate (also updates returned dpi_*).
+                dpf_o = delta_p_feed(mo, rho_O, feed_O, P_tank_O)
+                dpf_f_base = delta_p_feed(mf, rho_F, feed_F, P_tank_F)
+                if config.regen_cooling is not None and config.regen_cooling.enabled:
+                    dpf_f = dpf_f_base + delta_p_regen_channels(
+                        mf,
+                        rho_F,
+                        mu_F,
+                        config.regen_cooling,
+                        P_tank_F,
+                    )
+                else:
+                    dpf_f = dpf_f_base
+                Pi_o = float(P_tank_O - dpf_o)
+                Pi_f = float(P_tank_F - dpf_f)
+                dpi_o = max(0.0, Pi_o - Pc)
+                dpi_f = max(0.0, Pi_f - Pc)
+
+                if Pi_o < Pc:
+                    Cdo = float(min(cd_from_re(0.0, discharge_O, P_inlet=Pi_o, T_inlet=T_tank_O), cd_eff_o))
+                else:
+                    u_o2 = mo / (rho_O * A_O) if A_O > 0 else 0.0
+                    Re_o2 = calculate_reynolds_number(rho_O, u_o2, d_hyd_O, mu_O)
+                    Cdo = float(min(cd_from_re(Re_o2, discharge_O, P_inlet=Pi_o, T_inlet=T_tank_O), cd_eff_o))
+                if Pi_f < Pc:
+                    Cdf = float(min(cd_from_re(0.0, discharge_F, P_inlet=Pi_f, T_inlet=T_tank_F), cd_eff_f))
+                else:
+                    u_f2 = mf / (rho_F * A_F) if A_F > 0 else 0.0
+                    Re_f2 = calculate_reynolds_number(rho_F, u_f2, d_hyd_F, mu_F)
+                    Cdf = float(min(cd_from_re(Re_f2, discharge_F, P_inlet=Pi_f, T_inlet=T_tank_F), cd_eff_f))
 
                 # Symmetric relative residual (pure ``|Δ|/|prev|`` blows up when ṁ crosses ~0).
                 den_o = max(abs(mo_prev), abs(mo), 1e-18)
@@ -338,6 +378,14 @@ class ImpingingInjector(InjectorModel):
             u_sheet = np.sqrt(u_O ** 2 + u_F ** 2 - 2 * u_O * u_F * np.cos(imp_angle_rad))
             turb_fields = _injector_turbulence_fields(u_O, u_F)
 
+            # Weber numbers for the Lefebvre-style correlation: use the LIQUID density (as in the correlation),
+            # but blend in sheet kinetic energy so impingement physics affects breakup without switching density phases.
+            # This avoids the previous failure mode where tiny liquid-We produced unrealistically small D32, and also
+            # avoids the opposite failure mode where gas-density We + tiny D32 destroyed chamber closure.
+            alpha_sheet = 0.35
+            u_eff_O = float(np.sqrt(max(u_O, 0.0) ** 2 + (alpha_sheet * max(u_sheet, 0.0)) ** 2))
+            u_eff_F = float(np.sqrt(max(u_F, 0.0) ** 2 + (alpha_sheet * max(u_sheet, 0.0)) ** 2))
+
             J = momentum_flux_ratio(rho_O, u_O, rho_F, u_F)
             MR = mdot_O / mdot_F if mdot_F > 0 else np.inf
             TMR = thrust_momentum_ratio(J, MR)
@@ -347,15 +395,23 @@ class ImpingingInjector(InjectorModel):
             else:
                 theta = spray_angle_from_TMR(TMR)
 
-            We_O = weber_number(rho_O, u_O, geometry.oxidizer.d_jet, sigma_O)
-            We_F = weber_number(rho_F, u_F, geometry.fuel.d_jet, sigma_F)
+            We_O = weber_number(rho_O, u_eff_O, geometry.oxidizer.d_jet, sigma_O)
+            We_F = weber_number(rho_F, u_eff_F, geometry.fuel.d_jet, sigma_F)
+
+            _we_cap = getattr(spray_cfg.smd, "we_corr_max", None)
+            if _we_cap is not None and np.isfinite(float(_we_cap)) and float(_we_cap) > 0:
+                We_O_smd = float(min(We_O, float(_we_cap)))
+                We_F_smd = float(min(We_F, float(_we_cap)))
+            else:
+                We_O_smd = float(We_O)
+                We_F_smd = float(We_F)
 
             Oh_O = ohnesorge_number(mu_O, rho_O, sigma_O, geometry.oxidizer.d_jet)
             Oh_F = ohnesorge_number(mu_F, rho_F, sigma_F, geometry.fuel.d_jet)
 
             D32_O = smd_lefebvre(
                 geometry.oxidizer.d_jet,
-                We_O,
+                We_O_smd,
                 Oh_O,
                 spray_cfg.smd.C,
                 spray_cfg.smd.m,
@@ -363,7 +419,7 @@ class ImpingingInjector(InjectorModel):
             )
             D32_F = smd_lefebvre(
                 geometry.fuel.d_jet,
-                We_F,
+                We_F_smd,
                 Oh_F,
                 spray_cfg.smd.C,
                 spray_cfg.smd.m,
@@ -384,8 +440,12 @@ class ImpingingInjector(InjectorModel):
                     "J": J,
                     "TMR": TMR,
                     "theta": theta,
+                    "u_eff_O": float(u_eff_O),
+                    "u_eff_F": float(u_eff_F),
                     "We_O": We_O,
                     "We_F": We_F,
+                    "We_O_smd": We_O_smd,
+                    "We_F_smd": We_F_smd,
                     "D32_O": D32_O,
                     "D32_F": D32_F,
                     "x_star": x_star,
