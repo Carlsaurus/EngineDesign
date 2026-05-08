@@ -210,6 +210,12 @@ def calculate_reaction_rate_constant(
             n_pre = eff_cfg.n_pre_hydrogen
             Ea = eff_cfg.Ea_hydrogen
             n_pressure = 0.5
+        elif fuel_type.upper() in ["CH4", "METHANE"]:
+            # Methane: explicit branch (falls back to hydrocarbon kinetics if no methane-specific attrs)
+            A0 = getattr(eff_cfg, "A0_methane", eff_cfg.A0_hydrocarbon)
+            n_pre = getattr(eff_cfg, "n_pre_methane", eff_cfg.n_pre_hydrocarbon)
+            Ea = getattr(eff_cfg, "Ea_methane", eff_cfg.Ea_hydrocarbon)
+            n_pressure = 0.8
         else:
             # Default to hydrocarbon
             A0 = eff_cfg.A0_hydrocarbon
@@ -233,6 +239,11 @@ def calculate_reaction_rate_constant(
             n_pre = 0.2
             Ea = 40000.0
             n_pressure = 0.5
+        elif fuel_type.upper() in ["CH4", "METHANE"]:
+            A0 = 1.5e7
+            n_pre = 0.3
+            Ea = 100000.0
+            n_pressure = 0.8
         else:
             # Default: generic hydrocarbon
             A0 = 1e7

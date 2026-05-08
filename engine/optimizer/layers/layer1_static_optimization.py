@@ -166,6 +166,40 @@ def _impinging_momentum_hinge_squared(
     return float(excess * excess)
 
 
+def _impinging_momentum_band_violation_squared(
+    R: Any,
+    *,
+    r_band_lo: Optional[float] = None,
+    r_band_hi: Optional[float] = None,
+) -> float:
+    """Normalized squared violation outside a configured momentum band.
+
+    Returns 0.0 when no valid band is configured or R is missing/non-finite.
+    """
+    if (
+        r_band_lo is None
+        or r_band_hi is None
+        or not np.isfinite(float(r_band_lo))
+        or not np.isfinite(float(r_band_hi))
+        or float(r_band_hi) <= float(r_band_lo)
+    ):
+        return 0.0
+    try:
+        r = float(R)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(r) or r <= 0.0:
+        return 0.0
+    lo = float(r_band_lo)
+    hi = float(r_band_hi)
+    if lo <= r <= hi:
+        return 0.0
+    excess = (lo - r) if r < lo else (r - hi)
+    band_span = max(hi - lo, 1e-9)
+    norm = excess / band_span
+    return float(norm * norm)
+
+
 def _impinging_angle_hinge_squared(
     impingement_angle_deg: Any,
     *,
@@ -994,7 +1028,10 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
         if A_fuel_flow > 0:
             area_ratio = A_lox_flow / A_fuel_flow
             Cd_ratio = 0.4 / 0.65
-            rho_ratio = np.sqrt(1140.0 / 780.0)
+            rho_ratio = np.sqrt(
+                max(float(constants.get("rho_oxidizer", 1140.0)), 1e-9)
+                / max(float(constants.get("rho_fuel", 780.0)), 1e-9)
+            )
             delta_p_ratio_est = np.sqrt(1.2)
             area_ratio_factor = Cd_ratio * rho_ratio * delta_p_ratio_est
             required_area_ratio = optimal_of / area_ratio_factor if area_ratio_factor > 0 else np.inf
@@ -1016,7 +1053,10 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
         if A_fuel_flow > 0:
             area_ratio = A_lox_flow / A_fuel_flow
             Cd_ratio = 0.4 / 0.65
-            rho_ratio = np.sqrt(1140.0 / 780.0)
+            rho_ratio = np.sqrt(
+                max(float(constants.get("rho_oxidizer", 1140.0)), 1e-9)
+                / max(float(constants.get("rho_fuel", 780.0)), 1e-9)
+            )
             delta_p_ratio_est = np.sqrt(1.2)
             area_ratio_factor = Cd_ratio * rho_ratio * delta_p_ratio_est
             required_area_ratio = optimal_of / area_ratio_factor if area_ratio_factor > 0 else np.inf
@@ -1059,10 +1099,6 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
     if target_thrust > 0 and np.isfinite(F_actual):
         rel_error = abs(F_actual - target_thrust) / target_thrust
         deadband = 0.02  # 2% tolerance
-        
-        # Soft deadband: Always apply a tiny gradient so the optimizer isn't "blind" 
-        # inside the deadband. This encourages exact matching even if < 2% error.
-        thrust_penalty_sq_term += (0.1 * rel_error) ** 2
 
         if rel_error > deadband:
             # Strong penalty for exceeding deadband
@@ -1190,8 +1226,8 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
         float(constants.get("injector_dp_ratio_O_max", 0.35)),
     )
     dp_f_band = (
-        float(constants.get("injector_dp_ratio_F_min", 0.50)),
-        float(constants.get("injector_dp_ratio_F_max", 1.20)),
+        float(constants.get("injector_dp_ratio_F_min", 0.15)),
+        float(constants.get("injector_dp_ratio_F_max", 0.35)),
     )
     _c_sf_raw = constants.get("injector_dp_ratio_O_soft_floor")
     dp_o_soft_floor_worker: Optional[float] = (
@@ -1226,6 +1262,11 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
             momentum_term = _impinging_momentum_hinge_squared(
                 R_val, r_band_lo=_mlo, r_band_hi=_mhi
             )
+            # Momentum band is part of final validation; mirror that in feasibility search so
+            # the optimizer cannot settle on a momentum-failing "best objective" point.
+            infeasibility_score += _impinging_momentum_band_violation_squared(
+                R_val, r_band_lo=_mlo, r_band_hi=_mhi
+            )
         if W_ANGLE > 0.0:
             _alo = float(_ang_lo_c) if _ang_lo_c is not None else None
             _ahi = float(_ang_hi_c) if _ang_hi_c is not None else None
@@ -1256,6 +1297,13 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
             rho_ox_c,
             rho_fu_c,
         )
+    # AO/AF geometry term is a guidance aid; taper it as O/F approaches target so it doesn't
+    # dominate residual after core requirements are already satisfied.
+    _of_tol_for_geom = float(constants.get("layer1_of_validation_tol", 0.15))
+    _of_tol_for_geom = max(0.05, _of_tol_for_geom)
+    _of_err_for_geom = of_error if np.isfinite(of_error) else 1.0
+    geom_ao_af_scale = min(1.0, float(_of_err_for_geom / _of_tol_for_geom) ** 2)
+    geom_ao_af_weighted = W_geom_ao_af * geom_ao_af_term * geom_ao_af_scale
 
     injector_dp_weighted = 0.0
     if isinstance(result, dict):
@@ -1319,7 +1367,7 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
             W_CHAMBER_SHAPE * chamber_shape_term +
             W_MOM * momentum_term +
             W_ANGLE * angle_term +
-            W_geom_ao_af * geom_ao_af_term +
+            geom_ao_af_weighted +
             W_SMD * smd_term +
             injector_dp_weighted
         )
@@ -2359,6 +2407,10 @@ def run_layer1_optimization(
     layer1_W_OF_low_MR_scale = max(1.0, float(_w_ol)) if _w_ol is not None else 1.0
     _w_oh = requirements.get("layer1_W_OF_high_MR_scale")
     layer1_W_OF_high_MR_scale = max(1.0, float(_w_oh)) if _w_oh is not None else 1.0
+    # Impinging methane runs can stall at high O/F while still satisfying momentum/ΔP if
+    # AO/AF geometry guidance is disabled. Apply a conservative adaptive fallback when unset.
+    if l1_injector_type == "impinging" and layer1_W_geom_ao_af <= 0.0:
+        layer1_W_geom_ao_af = max(400.0, 0.05 * layer1_W_OF_obj)
     layer1_of_validation_tol = _requirement_float(requirements, "layer1_of_validation_tol", 0.15)
     # Final validation uses ``layer1_thrust_validation_rel_tol`` when set; errors_acceptable must match.
     _thr_gate_yaml = requirements.get("layer1_thrust_validation_rel_tol")
@@ -2771,7 +2823,10 @@ def run_layer1_optimization(
                 if A_eff_F > 0:
                     area_ratio = A_eff_O / A_eff_F
                     Cd_ratio = 0.4 / 0.65
-                    rho_ratio = np.sqrt(1140.0 / 780.0)
+                    rho_ratio = np.sqrt(
+                        max(float(config.fluids["oxidizer"].density), 1e-9)
+                        / max(float(config.fluids["fuel"].density), 1e-9)
+                    )
                     delta_p_ratio_est = np.sqrt(1.2)
                     area_ratio_factor = Cd_ratio * rho_ratio * delta_p_ratio_est
                     required_area_ratio = optimal_of / area_ratio_factor if area_ratio_factor > 0 else np.inf
@@ -2784,7 +2839,10 @@ def run_layer1_optimization(
                 if A_fuel_g > 0:
                     area_ratio = A_lox_g / A_fuel_g
                     Cd_ratio = 0.4 / 0.65
-                    rho_ratio = np.sqrt(1140.0 / 780.0)
+                    rho_ratio = np.sqrt(
+                        max(float(config.fluids["oxidizer"].density), 1e-9)
+                        / max(float(config.fluids["fuel"].density), 1e-9)
+                    )
                     delta_p_ratio_est = np.sqrt(1.2)
                     area_ratio_factor = Cd_ratio * rho_ratio * delta_p_ratio_est
                     required_area_ratio = optimal_of / area_ratio_factor if area_ratio_factor > 0 else np.inf
@@ -2810,7 +2868,10 @@ def run_layer1_optimization(
                 if A_eff_F > 0:
                     area_ratio = A_eff_O / A_eff_F
                     Cd_ratio = 0.4 / 0.65
-                    rho_ratio = np.sqrt(1140.0 / 780.0)
+                    rho_ratio = np.sqrt(
+                        max(float(config.fluids["oxidizer"].density), 1e-9)
+                        / max(float(config.fluids["fuel"].density), 1e-9)
+                    )
                     delta_p_ratio_est = np.sqrt(1.2)
                     area_ratio_factor = Cd_ratio * rho_ratio * delta_p_ratio_est
                     required_area_ratio = optimal_of / area_ratio_factor if area_ratio_factor > 0 else np.inf
@@ -2823,7 +2884,10 @@ def run_layer1_optimization(
                 if A_fuel_g > 0:
                     area_ratio = A_lox_g / A_fuel_g
                     Cd_ratio = 0.4 / 0.65
-                    rho_ratio = np.sqrt(1140.0 / 780.0)
+                    rho_ratio = np.sqrt(
+                        max(float(config.fluids["oxidizer"].density), 1e-9)
+                        / max(float(config.fluids["fuel"].density), 1e-9)
+                    )
                     delta_p_ratio_est = np.sqrt(1.2)
                     area_ratio_factor = Cd_ratio * rho_ratio * delta_p_ratio_est
                     required_area_ratio = optimal_of / area_ratio_factor if area_ratio_factor > 0 else np.inf
@@ -2928,6 +2992,11 @@ def run_layer1_optimization(
                     r_band_lo=layer1_impinging_R_mom_lo,
                     r_band_hi=layer1_impinging_R_mom_hi,
                 )
+                infeasibility_score += _impinging_momentum_band_violation_squared(
+                    R_m,
+                    r_band_lo=layer1_impinging_R_mom_lo,
+                    r_band_hi=layer1_impinging_R_mom_hi,
+                )
             if layer1_W_SMD > 0.0:
                 _mr_smd_main = float(MR_actual) if np.isfinite(MR_actual) and MR_actual > 0 else None
                 smd_term, smd_eff_um, imp_angle_deg = _impinging_smd_penalty_with_angle(
@@ -2968,6 +3037,10 @@ def run_layer1_optimization(
                 geom_ao_af_term, geom_ao_af_ratio_curr, expected_ao_af_for_R1_curr = (
                     _geom_ao_af_momentum_hint_squared(Aog_h, Afg_h, optimal_of, rho_o_v, rho_f_v)
                 )
+        _of_tol_for_geom = max(0.05, float(layer1_of_validation_tol))
+        _of_err_for_geom = of_error if np.isfinite(of_error) else 1.0
+        geom_ao_af_scale = min(1.0, float(_of_err_for_geom / _of_tol_for_geom) ** 2)
+        geom_ao_af_weighted = layer1_W_geom_ao_af * geom_ao_af_term * geom_ao_af_scale
         
         # ------------------------------------------------------------------
         # Lexicographic-ish scalarization with normalized weights
@@ -3006,7 +3079,7 @@ def run_layer1_optimization(
                 layer1_W_chamber_shape * chamber_shape_term +
                 W_MOM * momentum_term +
                 layer1_W_impinging_angle * angle_term +
-                W_GEOM_AO_AF * geom_ao_af_term
+                geom_ao_af_weighted
                 + layer1_W_SMD * smd_term
             )
         
@@ -3219,7 +3292,8 @@ def run_layer1_optimization(
                 "smd_penalty": float(layer1_W_SMD * smd_term),
                 "effective_smd_microns": _finite_or_none(smd_eff_um),
                 "impingement_angle_deg": _finite_or_none(imp_angle_deg),
-                "geom_ao_af_momentum_penalty": float(W_GEOM_AO_AF * geom_ao_af_term),
+                "geom_ao_af_momentum_penalty": float(geom_ao_af_weighted),
+                "geom_ao_af_momentum_scale": float(geom_ao_af_scale),
                 "geom_ao_af": geom_ao_af_ratio_curr,
                 "expected_ao_af_for_R1": expected_ao_af_for_R1_curr,
                 "infeasibility_penalty": float(BASE_INFEAS + W_INFEAS * infeasibility_score) if infeasibility_score > 0 or length_violation else 0.0,
@@ -3445,6 +3519,7 @@ def run_layer1_optimization(
         'layer1_W_OF': layer1_W_OF_obj,
         'layer1_W_OF_low_MR_scale': layer1_W_OF_low_MR_scale,
         'layer1_W_OF_high_MR_scale': layer1_W_OF_high_MR_scale,
+        'layer1_of_validation_tol': layer1_of_validation_tol,
         'target_thrust': target_thrust,
         'optimal_of': optimal_of,
     }
@@ -4108,6 +4183,32 @@ def run_layer1_optimization(
                         r_band_hi=layer1_impinging_R_mom_hi,
                     )
                 )
+            # Audit fields for UI (same definitions as impinging.flows momentum_ratio_R)
+            for _rk, _cast in (
+                ("v_O_bulk", float),
+                ("v_F_bulk", float),
+                ("A_jet_O", float),
+                ("A_jet_F", float),
+                ("rho_O_momentum", float),
+                ("rho_F_momentum", float),
+                ("d_jet_O", float),
+                ("d_jet_F", float),
+            ):
+                _rv = _diag_vals.get(_rk)
+                if _rv is not None:
+                    try:
+                        _rf = _cast(_rv)
+                        if np.isfinite(_rf):
+                            initial_performance[_rk] = _rf
+                    except (TypeError, ValueError):
+                        pass
+            for _ik in ("momentum_ratio_n_elements_O", "momentum_ratio_n_elements_F"):
+                _iv = _diag_vals.get(_ik)
+                if _iv is not None:
+                    try:
+                        initial_performance[_ik] = int(_iv)
+                    except (TypeError, ValueError):
+                        pass
         try:
             ig = optimized_config.injector.geometry
             rho_o_p = float(optimized_config.fluids["oxidizer"].density)
@@ -4328,6 +4429,10 @@ def run_layer1_optimization(
         and dp_gate_passed
         and momentum_gate_passed
     )
+    # If final validation gates pass, this run is converged for Layer 1 purposes
+    # even when soft guidance terms (e.g., AO/AF hint) keep residual above obj_tolerance.
+    if pressure_candidate_valid:
+        opt_state["converged"] = True
     
     # Build failure reasons
     failure_reasons = []
@@ -4405,6 +4510,18 @@ def run_layer1_optimization(
     final_performance["injector_dp_ratio_F"] = ratio_f_val if np.isfinite(ratio_f_val) else None
     final_performance["layer1_Lstar_search_min_m"] = float(min_Lstar)
     final_performance["layer1_Lstar_search_max_m"] = float(max_Lstar)
+    final_performance["layer1_W_geom_ao_af_momentum_effective"] = float(layer1_W_geom_ao_af)
+    try:
+        if isinstance(requirements, dict):
+            req_used = {
+                str(k): requirements.get(k) for k in sorted(requirements.keys(), key=str)
+            }
+            req_used["W_geom_ao_af_momentum"] = float(layer1_W_geom_ao_af)
+            final_performance["layer1_requirements_used"] = req_used
+        else:
+            final_performance["layer1_requirements_used"] = {}
+    except Exception:
+        final_performance["layer1_requirements_used"] = {}
     try:
         from engine.pipeline.config_schemas import ensure_chamber_geometry as _eg_lstar_diag
         _cgd = _eg_lstar_diag(optimized_config)

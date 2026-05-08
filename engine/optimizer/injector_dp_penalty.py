@@ -23,7 +23,11 @@ def stream_injector_dp_soft_floor_squared(r: Optional[float], floor: Optional[fl
 
 
 def stream_injector_dp_band_hinge_squared(r: Optional[float], lo: float, hi: float) -> float:
-    """Squared hinge penalty outside [lo, hi]. Zero when lo <= r <= hi."""
+    """Normalized squared hinge penalty outside [lo, hi]. Zero when lo <= r <= hi.
+
+    Normalization by band width keeps penalty strength consistent across different
+    configured bands and avoids under-penalizing small absolute misses.
+    """
     if r is None:
         return 0.0
     try:
@@ -35,9 +39,10 @@ def stream_injector_dp_band_hinge_squared(r: Optional[float], lo: float, hi: flo
     lo_f, hi_f = float(lo), float(hi)
     if hi_f <= lo_f:
         return 0.0
+    span = max(hi_f - lo_f, 1e-9)
     below = max(0.0, lo_f - rr)
     above = max(0.0, rr - hi_f)
-    return float(below * below + above * above)
+    return float((below / span) ** 2 + (above / span) ** 2)
 
 
 def injector_dp_ratio_penalty_weighted(

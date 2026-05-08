@@ -20,12 +20,14 @@ from engine.optimizer.layers.layer1_static_optimization import (
     run_layer1_optimization,
     _expected_geom_ao_af_for_unit_momentum_ratio,
     _geom_ao_af_momentum_hint_squared,
+    _impinging_momentum_band_violation_squared,
     _impinging_momentum_hinge_squared,
     _merge_runner_eval_into_performance,
     _snap_integer_dims,
 )
 from engine.core.closure import flows
 from engine.core.runner import PintleEngineRunner
+from engine.core.injectors.impinging import momentum_ratio_R_from_bulk_velocities
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +167,17 @@ class TestLayer1ImpingingVector(unittest.TestCase):
         self.assertGreater(_impinging_momentum_hinge_squared(0.84, r_band_lo=lo, r_band_hi=hi), 0.0)
         self.assertGreater(_impinging_momentum_hinge_squared(1.16, r_band_lo=lo, r_band_hi=hi), 0.0)
 
+    def test_momentum_band_violation_squared_zero_inside(self):
+        self.assertAlmostEqual(
+            _impinging_momentum_band_violation_squared(1.0, r_band_lo=0.8, r_band_hi=1.2),
+            0.0,
+            places=12,
+        )
+
+    def test_momentum_band_violation_squared_positive_outside(self):
+        v = _impinging_momentum_band_violation_squared(0.619, r_band_lo=0.8, r_band_hi=1.2)
+        self.assertGreater(v, 0.0)
+
     def test_expected_geom_ao_af_matches_mr_over_sqrt_density_ratio(self):
         rho_o = 1141.0
         rho_f = 423.0
@@ -253,6 +266,37 @@ class TestLayer1ImpingingVector(unittest.TestCase):
         self.assertIn("momentum_ratio_R", diag)
         self.assertTrue(np.isfinite(diag["momentum_ratio_R"]))
         self.assertGreater(diag["momentum_ratio_R"], 0.0)
+        self.assertIn("v_O_bulk", diag)
+        self.assertIn("v_F_bulk", diag)
+        self.assertIn("rho_O_momentum", diag)
+        self.assertIn("rho_F_momentum", diag)
+
+    def test_momentum_ratio_R_matches_analytic(self):
+        rho_O, rho_F = 1000.0, 500.0
+        v_O = 10.0
+        v_F = v_O * np.sqrt(rho_O / rho_F)
+        R1 = momentum_ratio_R_from_bulk_velocities(rho_O, rho_F, v_O, v_F)
+        self.assertAlmostEqual(R1, 1.0, places=12)
+
+        R2 = momentum_ratio_R_from_bulk_velocities(1000.0, 1000.0, 20.0, 10.0)
+        self.assertAlmostEqual(R2, 2.0, places=12)
+
+        R3 = momentum_ratio_R_from_bulk_velocities(1000.0, 1000.0, 10.0, 20.0)
+        self.assertAlmostEqual(R3, 0.5, places=12)
+
+    def test_flows_momentum_ratio_matches_bulk_formula(self):
+        cfg = load_config(str(ROOT / "configs" / "impinging_smoke.yaml"))
+        Po = cfg.lox_tank.initial_pressure_psi * 6894.76
+        Pf = cfg.fuel_tank.initial_pressure_psi * 6894.76
+        Pc = 2.0e6
+        _mdot_o, _mdot_f, diag = flows(Po, Pf, Pc, cfg)
+        R_calc = momentum_ratio_R_from_bulk_velocities(
+            float(diag["rho_O_momentum"]),
+            float(diag["rho_F_momentum"]),
+            float(diag["v_O_bulk"]),
+            float(diag["v_F_bulk"]),
+        )
+        np.testing.assert_allclose(diag["momentum_ratio_R"], R_calc, rtol=1e-9, atol=0.0)
 
     def test_runner_evaluate_impinging_smoke(self):
         cfg = load_config(str(ROOT / "configs" / "impinging_smoke.yaml"))

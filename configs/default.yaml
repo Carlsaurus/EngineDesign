@@ -1,16 +1,16 @@
 fluids:
   fuel:
-    name: Ethanol
-    density: 789.0
-    viscosity: 0.0012
-    surface_tension: 0.0223
-    vapor_pressure: 5800.0
-    specific_heat: 2440.0
-    thermal_conductivity: 0.17
-    temperature: 293.0
-    latent_heat: 838000.0
-    boiling_point: 351.4
-    molecular_weight: 46.07
+    name: Methane
+    density: 422.6
+    viscosity: 0.00012
+    surface_tension: 0.0134
+    vapor_pressure: 101325.0
+    specific_heat: 3348.0
+    thermal_conductivity: 0.204
+    temperature: 112.0
+    latent_heat: 510000.0
+    boiling_point: 111.65
+    molecular_weight: 16.04
   oxidizer:
     name: LOX
     density: 1140.0
@@ -215,15 +215,15 @@ combustion:
     use_parallel_cea_build: false
     cea_parallel_workers: null
     ox_name: LOX
-    fuel_name: Ethanol
-    expansion_ratio: 6.142319923551047
-    cache_file: output/cache/cea_cache_LOX_Ethanol_3D.npz
+    fuel_name: CH4
+    expansion_ratio: 7.443037974683544
+    cache_file: output/cache/cea_cache_LOX_CH4_3D.npz
     Pc_range:
     - 1000000.0
     - 9000000.0
     MR_range:
-    - 1.0
-    - 2.5
+    - 2.4
+    - 4.2
     eps_range:
     - 4.0
     - 15.0
@@ -257,7 +257,7 @@ combustion:
     tau_ref_T: 3500.0
     n_pressure: 0.8
     tau_Tc_floor_K: null
-    T_star_fuel_cap_K: 700.0
+    T_star_fuel_cap_K: 500.0
     A0_hydrocarbon: 10000000.0
     Ea_hydrocarbon: 80000.0
     n_pre_hydrocarbon: 0.3
@@ -378,8 +378,8 @@ design_requirements:
   target_apogee: 3048.0
   optimal_of_ratio: 3.5
   target_burn_time: 5.8
-  max_lox_tank_pressure_psi: 900.0
-  max_fuel_tank_pressure_psi: 900.0
+  max_lox_tank_pressure_psi: 700.0
+  max_fuel_tank_pressure_psi: 700.0
   max_P_tank_O: null
   max_P_tank_F: null
   max_engine_length: 0.4
@@ -403,9 +403,9 @@ design_requirements:
   injector_dp_ratio_F_min: 0.15
   injector_dp_ratio_F_max: 0.35
   W_geom_ao_af_momentum: 0.0
-  W_MOM: 600.0
-  impinging_momentum_R_min: 0.6
-  impinging_momentum_R_max: 1.4
+  W_MOM: 2400.0
+  impinging_momentum_R_min: 0.8
+  impinging_momentum_R_max: 1.2
   layer1_impinging_angle_deg_min: 55.0
   layer1_impinging_angle_deg_max: 90.0
   W_IMPINGING_ANGLE: 400.0

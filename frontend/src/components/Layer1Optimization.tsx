@@ -22,12 +22,78 @@ import type {
   Layer1ProgressEvent,
   Layer1Results,
   DesignRequirements,
-  ChamberGeometryResponse
+  ChamberGeometryResponse,
+  SaveDesignRequirementsResponse,
 } from '../api/client';
 import { ChamberContourPlot } from './ChamberContourPlot';
+import { stableStringify } from '../utils/stableStringify';
+
+/** Fill missing Design Requirements keys only; never overwrite user-saved values. */
+function withDefaults(user: Record<string, unknown>, defaults: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...user };
+  for (const [k, v] of Object.entries(defaults)) {
+    const cur = out[k];
+    if (cur === undefined || cur === null || (typeof cur === 'number' && !Number.isFinite(cur))) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+const IMPINGING_BASELINE_DEFAULTS: Record<string, unknown> = {
+  max_chamber_outer_diameter: 0.2032,
+  max_nozzle_exit_diameter: 0.2032,
+  layer1_stagnation_pressure_frac_min: 0.65,
+  layer1_stagnation_pressure_frac_max: 0.95,
+  layer1_expansion_ratio_min: 3.0,
+  layer1_expansion_ratio_max: 14.0,
+  injector_dp_ratio_O_min: 0.15,
+  injector_dp_ratio_O_max: 0.35,
+  injector_dp_ratio_F_min: 0.15,
+  injector_dp_ratio_F_max: 0.35,
+  layer1_W_THRUST: 6.0e4,
+  layer1_W_OF: 2.0e4,
+  layer1_W_OF_low_MR_scale: 1.0,
+  layer1_W_OF_high_MR_scale: 1.0,
+  W_MOM: 2400.0,
+  impinging_momentum_R_min: 0.8,
+  impinging_momentum_R_max: 1.2,
+  W_DP: 500.0,
+  W_DP_O: 1000.0,
+  W_DP_F: 1000.0,
+  W_DP_HIGH: 8000.0,
+  W_IMPINGING_ANGLE: 400.0,
+  layer1_impinging_angle_deg_min: 55.0,
+  layer1_impinging_angle_deg_max: 90.0,
+  W_SMD: 0.0,
+  W_CHAMBER_SHAPE: 2500.0,
+  layer1_chamber_dt_ratio_min: 2.2,
+  layer1_chamber_dt_ratio_max: 3.2,
+  layer1_chamber_ld_ratio_min: 1.6,
+  layer1_chamber_ld_ratio_max: 3.2,
+  target_smd_microns: 50.0,
+  layer1_smd_rel_tol: 0.20,
+};
+
+const IMPINGING_FROZEN_RESETS: Record<string, unknown> = {
+  D_chamber_outer_mm: null,
+  A_throat_mm2: null,
+  Lstar_mm: null,
+  expansion_ratio: null,
+  P_O_start_psi: null,
+  P_F_start_psi: null,
+  d_pintle_tip_mm: null,
+  h_gap_mm: null,
+  n_orifices: null,
+  d_orifice_mm: null,
+};
 
 interface Layer1OptimizationProps {
-  requirements: DesignRequirements | null;
+  requirements: DesignRequirements;
+  isDirty: boolean;
+  saveRequirementsToServer: (
+    reqs: DesignRequirements
+  ) => Promise<{ error?: string; data?: SaveDesignRequirementsResponse }>;
 }
 
 // Helper component for result cards
@@ -92,11 +158,24 @@ function ResultCard({
 // Helper component for validation cards
 function ValidationCard({ label, passed }: { label: string; passed: boolean | undefined }) {
   const isPassed = passed === true;
+  const isUnknown = passed === undefined;
   return (
-    <div className={`rounded-lg p-3 border ${isPassed ? 'bg-green-500/10 border-green-500/30' : 'bg-red-500/10 border-red-500/30'}`}>
+    <div
+      className={`rounded-lg p-3 border ${
+        isUnknown
+          ? 'bg-slate-500/10 border-slate-500/30'
+          : isPassed
+            ? 'bg-green-500/10 border-green-500/30'
+            : 'bg-red-500/10 border-red-500/30'
+      }`}
+    >
       <p className="text-xs text-[var(--color-text-secondary)] mb-1">{label}</p>
-      <p className={`text-lg font-bold ${isPassed ? 'text-green-400' : 'text-red-400'}`}>
-        {isPassed ? '✓ PASS' : '✗ FAIL'}
+      <p
+        className={`text-lg font-bold ${
+          isUnknown ? 'text-slate-400' : isPassed ? 'text-green-400' : 'text-red-400'
+        }`}
+      >
+        {isUnknown ? '—' : isPassed ? '✓ PASS' : '✗ FAIL'}
       </p>
     </div>
   );
@@ -320,7 +399,11 @@ function ParameterConvergencePlots({
   );
 }
 
-export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
+export function Layer1Optimization({
+  requirements,
+  isDirty,
+  saveRequirementsToServer,
+}: Layer1OptimizationProps) {
   const [settings, setSettings] = useState<Layer1Settings>({
     thrust_tolerance: 0.1, // 10%
   });
@@ -338,6 +421,8 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
   }>>([]);
   const [showParameterPlots, setShowParameterPlots] = useState(false);
   const [showInjectorPressures, setShowInjectorPressures] = useState(false);
+  const [showSolverInputsEcho, setShowSolverInputsEcho] = useState(false);
+  const [momentumRAuditOpen, setMomentumRAuditOpen] = useState(false);
   const [chamberGeometry, setChamberGeometry] = useState<ChamberGeometryResponse | null>(null);
   const [eventSourceRef, setEventSourceRef] = useState<EventSource | null>(null);
   const [activeInjectorType, setActiveInjectorType] = useState<string>('unknown');
@@ -440,97 +525,49 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
     const designReq = (cfg.data?.config?.design_requirements as Record<string, unknown> | undefined) ?? {};
     const frozen = (designReq.frozen_parameters as Record<string, unknown> | undefined) ?? {};
     const injectorType = String(injector.type ?? 'unknown').toLowerCase();
+    const userMinLstar = Number(designReq.min_Lstar);
+    const userMaxLstar = Number(designReq.max_Lstar);
+    const preservedMinLstar = Number.isFinite(userMinLstar) && userMinLstar > 0 ? userMinLstar : 0.76;
+    const preservedMaxLstar = Number.isFinite(userMaxLstar) && userMaxLstar > preservedMinLstar ? userMaxLstar : 1.5;
+    const userNDoubletsMax = Number(designReq.layer1_impinging_n_doublets_max);
+    const preservedNDoubletsMax =
+      Number.isFinite(userNDoubletsMax) && userNDoubletsMax >= 5
+        ? Math.round(userNDoubletsMax)
+        : 20;
     // Do not treat conservative tank caps (<850 psi) as "needs baseline": users may intentionally
     // cap lower; forcing 900 here overwrote Design Requirements before every Layer 1 run.
     const needImpingingBaseline =
       Number(designReq.max_chamber_outer_diameter ?? 0) < 0.20 ||
       Number(designReq.max_nozzle_exit_diameter ?? 0) < 0.20 ||
-      Number(designReq.layer1_impinging_n_doublets_max ?? 0) < 20 ||
-      Number(designReq.layer1_stagnation_pressure_frac_max ?? 0) < 0.90 ||
-      Number(designReq.injector_dp_ratio_O_max ?? 1.0) > 0.35 ||
-      Number(designReq.injector_dp_ratio_F_max ?? 1.0) > 0.35 ||
       Number(designReq.layer1_W_OF ?? 1.0e4) > 2.0e5 ||
-      Number(designReq.min_Lstar ?? 0) < 0.76 ||
-      Number(designReq.max_Lstar ?? 0) < 1.4 ||
       frozen.d_pintle_tip_mm != null ||
       frozen.h_gap_mm != null ||
       frozen.n_orifices != null ||
       frozen.d_orifice_mm != null;
+
+    const mergedDesignRequirements: Record<string, unknown> = {
+      ...withDefaults(
+        { ...(designReq as Record<string, unknown>) },
+        {
+          ...IMPINGING_BASELINE_DEFAULTS,
+          min_Lstar: preservedMinLstar,
+          max_Lstar: preservedMaxLstar,
+          layer1_impinging_n_doublets_max: preservedNDoubletsMax,
+        }
+      ),
+      frozen_parameters: {
+        ...(frozen as Record<string, unknown>),
+        ...IMPINGING_FROZEN_RESETS,
+      },
+    };
+
     if (injectorType === 'impinging') {
-      if (!needImpingingBaseline) {
-        setActiveInjectorType('impinging');
-        return true;
-      }
-      const baselineOnlyUpdate: Record<string, unknown> = {
-        feed_system: {
-          ...((cfg.data?.config?.feed_system as Record<string, unknown> | undefined) ?? {}),
-          oxidizer: {
-            ...((((cfg.data?.config?.feed_system as Record<string, unknown> | undefined)?.oxidizer as Record<string, unknown> | undefined) ?? {})),
-            // Two parallel 3/8" LOX lines -> equivalent single-line area model.
-            d_inlet: 0.013470353244117013,
-            A_hydraulic: 1.4251150082346222e-4,
-          },
-        },
-        design_requirements: {
-          ...(designReq as Record<string, unknown>),
-          max_chamber_outer_diameter: 0.2032,
-          max_nozzle_exit_diameter: 0.2032,
-          layer1_stagnation_pressure_frac_min: 0.65,
-          layer1_stagnation_pressure_frac_max: 0.95,
-          layer1_expansion_ratio_min: 3.0,
-          layer1_expansion_ratio_max: 14.0,
-          layer1_impinging_n_doublets_max: 20,
-          min_Lstar: 0.76,
-          max_Lstar: 1.5,
-          injector_dp_ratio_O_min: 0.15,
-          injector_dp_ratio_O_max: 0.35,
-          injector_dp_ratio_F_min: 0.15,
-          injector_dp_ratio_F_max: 0.35,
-          layer1_W_THRUST: 6.0e4,
-          layer1_W_OF: 2.0e4,
-          layer1_W_OF_low_MR_scale: 1.0,
-          layer1_W_OF_high_MR_scale: 1.0,
-          W_MOM: 600.0,
-          impinging_momentum_R_min: 0.60,
-          impinging_momentum_R_max: 1.40,
-          W_DP: 500.0,
-          W_DP_O: 1000.0,
-          W_DP_F: 1000.0,
-          W_DP_HIGH: 8000.0,
-          W_IMPINGING_ANGLE: 400.0,
-          layer1_impinging_angle_deg_min: 55.0,
-          layer1_impinging_angle_deg_max: 90.0,
-          W_SMD: 0.0,
-          W_CHAMBER_SHAPE: 2500.0,
-          layer1_chamber_dt_ratio_min: 2.2,
-          layer1_chamber_dt_ratio_max: 3.2,
-          layer1_chamber_ld_ratio_min: 1.6,
-          layer1_chamber_ld_ratio_max: 3.2,
-          target_smd_microns: 50.0,
-          layer1_smd_rel_tol: 0.20,
-          frozen_parameters: {
-            ...(frozen as Record<string, unknown>),
-            // Let optimizer explore chamber size within requirements envelope.
-            D_chamber_outer_mm: null,
-            A_throat_mm2: null,
-            Lstar_mm: null,
-            expansion_ratio: null,
-            P_O_start_psi: null,
-            P_F_start_psi: null,
-            d_pintle_tip_mm: null,
-            h_gap_mm: null,
-            n_orifices: null,
-            d_orifice_mm: null,
-          },
-        },
-      };
-      const updBaseline = await updateConfig(baselineOnlyUpdate);
-      if (updBaseline.error) {
-        setError(`Failed to apply impinging baseline requirements: ${updBaseline.error}`);
-        return false;
+      if (needImpingingBaseline) {
+        setMessage(
+          'Injector is already impinging. Keeping your saved design requirements/feed settings as-is (no auto-baseline override).'
+        );
       }
       setActiveInjectorType('impinging');
-      setMessage('Applied impinging Layer 1 baseline requirements.');
       return true;
     }
     const impingingUpdate: Record<string, unknown> = {
@@ -552,77 +589,7 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
           },
         },
       },
-      feed_system: {
-        ...((cfg.data?.config?.feed_system as Record<string, unknown> | undefined) ?? {}),
-        oxidizer: {
-          ...((((cfg.data?.config?.feed_system as Record<string, unknown> | undefined)?.oxidizer as Record<string, unknown> | undefined) ?? {})),
-          // Two parallel 3/8" LOX lines -> equivalent single-line area model.
-          d_inlet: 0.013470353244117013,
-          A_hydraulic: 1.4251150082346222e-4,
-        },
-      },
-      // Apply impinging-friendly Layer-1 baseline so auto-switch does not inherit restrictive pintle settings.
-      design_requirements: {
-        ...(designReq as Record<string, unknown>),
-        max_chamber_outer_diameter: 0.2032,
-        max_nozzle_exit_diameter: 0.2032,
-        layer1_stagnation_pressure_frac_min: 0.65,
-        layer1_stagnation_pressure_frac_max: 0.95,
-        layer1_expansion_ratio_min: 3.0,
-        layer1_expansion_ratio_max: 14.0,
-        layer1_impinging_n_doublets_max: 20,
-        min_Lstar: 0.76,
-        max_Lstar: 1.5,
-        // Keep user-requested injector ΔP bands.
-        injector_dp_ratio_O_min: 0.15,
-        injector_dp_ratio_O_max: 0.35,
-        injector_dp_ratio_F_min: 0.15,
-        injector_dp_ratio_F_max: 0.35,
-        layer1_W_THRUST: 6.0e4,
-        layer1_W_OF: 2.0e4,
-        layer1_W_OF_low_MR_scale: 1.0,
-        layer1_W_OF_high_MR_scale: 1.0,
-        W_MOM: 600.0,
-        impinging_momentum_R_min: 0.60,
-        impinging_momentum_R_max: 1.40,
-        W_DP: 500.0,
-        W_DP_O: 1000.0,
-        W_DP_F: 1000.0,
-        W_DP_HIGH: 8000.0,
-        W_IMPINGING_ANGLE: 400.0,
-        layer1_impinging_angle_deg_min: 55.0,
-        layer1_impinging_angle_deg_max: 90.0,
-        W_SMD: 0.0,
-        W_CHAMBER_SHAPE: 2500.0,
-        layer1_chamber_dt_ratio_min: 2.2,
-        layer1_chamber_dt_ratio_max: 3.2,
-        layer1_chamber_ld_ratio_min: 1.6,
-        layer1_chamber_ld_ratio_max: 3.2,
-        target_smd_microns: 50.0,
-        layer1_smd_rel_tol: 0.20,
-        frozen_parameters: {
-          ...(frozen as Record<string, unknown>),
-          // Let optimizer explore chamber size within requirements envelope.
-          D_chamber_outer_mm: null,
-          A_throat_mm2: null,
-          Lstar_mm: null,
-          expansion_ratio: null,
-          P_O_start_psi: null,
-          P_F_start_psi: null,
-          d_pintle_tip_mm: null,
-          h_gap_mm: null,
-          n_orifices: null,
-          d_orifice_mm: null,
-        },
-      },
-      lox_tank: {
-        ...((cfg.data?.config?.lox_tank as Record<string, unknown> | undefined) ?? {}),
-        initial_pressure_psi: 600.0,
-      },
-      fuel_tank: {
-        ...((cfg.data?.config?.fuel_tank as Record<string, unknown> | undefined) ?? {}),
-        initial_pressure_psi: 520.0,
-      },
+      design_requirements: mergedDesignRequirements,
     };
     const upd = await updateConfig(impingingUpdate);
     if (upd.error) {
@@ -642,10 +609,16 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
   };
 
   const handleRun = async () => {
-    if (!requirements) {
-      setError('Please save design requirements first.');
-      return;
+    if (isDirty) {
+      setMessage('Auto-saving Design Requirements before run...');
+      const saveResp = await saveRequirementsToServer(requirements);
+      if (saveResp.error) {
+        setError(saveResp.error);
+        setMessage('');
+        return;
+      }
     }
+
     const ready = await ensureImpingingMode();
     if (!ready) {
       return;
@@ -775,14 +748,6 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
         </p>
       </div>
 
-      {/* Requirements Check */}
-      {!requirements && (
-        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4">
-          <p className="text-yellow-400">
-            ⚠️ Please set design requirements in the 'Design Requirements' tab first.
-          </p>
-        </div>
-      )}
 
       {/* Settings */}
       <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl p-6">
@@ -808,11 +773,16 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
       </div>
 
       {/* Run/Stop Button */}
-      <div className="flex justify-center gap-4">
+      <div className="flex flex-wrap justify-center items-center gap-4">
+        {isDirty && (
+          <span className="text-xs px-3 py-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 text-amber-300">
+            Unsaved Design Requirements — will auto-save on Run
+          </span>
+        )}
         <button
           onClick={handleRun}
-          disabled={isRunning || !requirements}
-          className={`px-8 py-4 font-bold rounded-lg text-white text-lg transition-all ${isRunning || !requirements
+          disabled={isRunning}
+          className={`px-8 py-4 font-bold rounded-lg text-white text-lg transition-all ${isRunning
             ? 'bg-gray-500 cursor-not-allowed'
             : 'bg-blue-600 hover:bg-blue-700 hover:scale-105'
             }`}
@@ -1080,7 +1050,7 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
                 }
                 return (
                   <ResultCard
-                    label="L* search band (Layer 1)"
+                    label="L* search band (Layer 1, used by solver)"
                     value={`${lo.toFixed(3)}–${hi.toFixed(3)} m`}
                     isText
                     color="blue"
@@ -1116,6 +1086,83 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
               />
             </div>
           </div>
+
+          {(() => {
+            const usedRaw = (results.performance as Record<string, unknown>).layer1_requirements_used;
+            if (!usedRaw || typeof usedRaw !== 'object') return null;
+            const used = usedRaw as Record<string, unknown>;
+            const keys = Object.keys(used).sort((a, b) => a.localeCompare(b));
+            const formObj = requirements as unknown as Record<string, unknown>;
+            return (
+              <details
+                open={showSolverInputsEcho}
+                onToggle={(e) => setShowSolverInputsEcho((e.target as HTMLDetailsElement).open)}
+                className="mb-6 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl p-4"
+              >
+                <summary className="cursor-pointer text-md font-semibold text-[var(--color-text-primary)]">
+                  Inputs the solver actually used (full audit)
+                </summary>
+                <p className="text-xs text-[var(--color-text-secondary)] mt-2 mb-3">
+                  Compares each key to your current Design Requirements form. After a run, values should match if you did not edit the form since running.
+                </p>
+                <div className="overflow-x-auto max-h-96 overflow-y-auto border border-[var(--color-border)] rounded-lg">
+                  <table className="min-w-full text-sm">
+                    <thead className="sticky top-0 bg-[var(--color-bg-primary)]">
+                      <tr className="text-left border-b border-[var(--color-border)]">
+                        <th className="p-2 font-medium text-[var(--color-text-secondary)]">Key</th>
+                        <th className="p-2 font-medium text-[var(--color-text-secondary)]">Value used</th>
+                        <th className="p-2 font-medium text-[var(--color-text-secondary)]">Matches form?</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {keys.map((key) => {
+                        const vUsed = used[key];
+                        const vForm = formObj[key];
+                        const usedS = stableStringify(vUsed);
+                        const formS = stableStringify(vForm);
+                        const match = usedS === formS;
+                        const derivedKeys = new Set([
+                          'report_every_n',
+                          'W_geom_ao_af_momentum',
+                        ]);
+                        const isDerived = derivedKeys.has(key) && !match;
+                        return (
+                          <tr key={key} className="border-b border-[var(--color-border)]/60">
+                            <td className="p-2 font-mono text-xs text-[var(--color-text-primary)] align-top">{key}</td>
+                            <td className="p-2 font-mono text-xs text-blue-300 align-top break-all max-w-md">
+                              {typeof vUsed === 'object' && vUsed !== null
+                                ? JSON.stringify(vUsed)
+                                : String(vUsed)}
+                            </td>
+                            <td className="p-2 align-top whitespace-nowrap">
+                              {match ? (
+                                <span className="text-green-400">Yes</span>
+                              ) : isDerived ? (
+                                <span
+                                  className="text-blue-300"
+                                  title={
+                                    key === 'report_every_n'
+                                      ? 'Internal optimizer reporting cadence (backend default). Not a design requirement mismatch.'
+                                      : 'Effective derived guidance value used by solver for this run.'
+                                  }
+                                >
+                                  Derived (hover)
+                                </span>
+                              ) : (
+                                <span className="text-amber-400" title={`Form: ${JSON.stringify(vForm)}`}>
+                                  No (hover)
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            );
+          })()}
 
           {/* Objective Diagnostics */}
           {results.convergence_info?.best_objective !== undefined && (
@@ -1327,29 +1374,57 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
           {/* Validation Status */}
           <div className="mb-6">
             <h4 className="text-md font-semibold text-[var(--color-text-primary)] mb-3">✓ Validation</h4>
-            <div className="grid grid-cols-5 gap-4">
-              <ValidationCard
-                label="Thrust Check"
-                passed={results.performance.thrust_check_passed}
-              />
-              <ValidationCard
-                label="O/F Check"
-                passed={results.performance.of_check_passed}
-              />
-              <ValidationCard
-                label="Stability Check"
-                passed={results.performance.stability_check_passed}
-              />
-              <ValidationCard
-                label="Geometry Check"
-                passed={results.performance.geometry_check_passed}
-              />
-              <ValidationCard
-                label="Pressure Candidate"
-                passed={results.performance.pressure_candidate_valid}
-              />
-            </div>
             {(() => {
+              const injType = String(
+                results.geometry?.injector_type ??
+                  (results.config?.injector as Record<string, unknown> | undefined)?.type ??
+                  ''
+              ).toLowerCase();
+              const isImpingingResults = injType === 'impinging';
+              return (
+                <div
+                  className={`grid gap-4 ${
+                    isImpingingResults
+                      ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-6'
+                      : 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-5'
+                  }`}
+                >
+                  <ValidationCard
+                    label="Thrust Check"
+                    passed={results.performance.thrust_check_passed}
+                  />
+                  <ValidationCard
+                    label="O/F Check"
+                    passed={results.performance.of_check_passed}
+                  />
+                  <ValidationCard
+                    label="Stability Check"
+                    passed={results.performance.stability_check_passed}
+                  />
+                  <ValidationCard
+                    label="Geometry Check"
+                    passed={results.performance.geometry_check_passed}
+                  />
+                  {isImpingingResults && (
+                    <ValidationCard
+                      label="Momentum Check"
+                      passed={results.performance.momentum_gate_passed}
+                    />
+                  )}
+                  <ValidationCard
+                    label="Pressure Candidate"
+                    passed={results.performance.pressure_candidate_valid}
+                  />
+                </div>
+              );
+            })()}
+            {(() => {
+              const injType = String(
+                results.geometry?.injector_type ??
+                  (results.config?.injector as Record<string, unknown> | undefined)?.type ??
+                  ''
+              ).toLowerCase();
+              const isImpingingResults = injType === 'impinging';
               const oRatio = typeof results.performance.injector_dp_ratio_O === 'number'
                 ? results.performance.injector_dp_ratio_O as number
                 : undefined;
@@ -1361,27 +1436,155 @@ export function Layer1Optimization({ requirements }: Layer1OptimizationProps) {
               const fMin = requirements?.injector_dp_ratio_F_min;
               const fMax = requirements?.injector_dp_ratio_F_max;
               const hasBands = [oMin, oMax, fMin, fMax].every((v) => typeof v === 'number');
-              if (!hasBands) return null;
+              const perf = results.performance;
+              const rVal =
+                typeof perf.momentum_ratio_R === 'number' && Number.isFinite(perf.momentum_ratio_R)
+                  ? perf.momentum_ratio_R
+                  : undefined;
+              const rMin = requirements?.impinging_momentum_R_min;
+              const rMax = requirements?.impinging_momentum_R_max;
+              const rBandOk =
+                typeof rMin === 'number' &&
+                typeof rMax === 'number' &&
+                rVal !== undefined &&
+                rVal >= rMin &&
+                rVal <= rMax;
+              const rPass =
+                typeof perf.momentum_gate_passed === 'boolean'
+                  ? perf.momentum_gate_passed
+                  : rBandOk;
+              const hasRBands = typeof rMin === 'number' && typeof rMax === 'number';
+              if (!hasBands && !isImpingingResults) return null;
+              if (isImpingingResults && !hasBands && !hasRBands && rVal === undefined) return null;
               const oPass = oRatio !== undefined ? (oRatio >= (oMin as number) && oRatio <= (oMax as number)) : undefined;
               const fPass = fRatio !== undefined ? (fRatio >= (fMin as number) && fRatio <= (fMax as number)) : undefined;
+              const gridCols = !isImpingingResults
+                ? 'grid-cols-1 md:grid-cols-2'
+                : hasBands
+                  ? 'grid-cols-1 md:grid-cols-3'
+                  : 'grid-cols-1';
               return (
-                <div className="mt-3 grid grid-cols-2 gap-4">
-                  <div className={`p-3 rounded-lg border ${oPass === true ? 'bg-green-500/10 border-green-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
-                    <p className="text-xs text-[var(--color-text-secondary)] mb-1">
-                      ΔP_O/Pc band [{(oMin as number).toFixed(3)}, {(oMax as number).toFixed(3)}]
-                    </p>
-                    <p className="font-mono text-sm">
-                      actual: {oRatio !== undefined ? oRatio.toFixed(3) : '—'} {oPass === true ? '✓' : oPass === false ? '✗' : ''}
-                    </p>
-                  </div>
-                  <div className={`p-3 rounded-lg border ${fPass === true ? 'bg-green-500/10 border-green-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
-                    <p className="text-xs text-[var(--color-text-secondary)] mb-1">
-                      ΔP_F/Pc band [{(fMin as number).toFixed(3)}, {(fMax as number).toFixed(3)}]
-                    </p>
-                    <p className="font-mono text-sm">
-                      actual: {fRatio !== undefined ? fRatio.toFixed(3) : '—'} {fPass === true ? '✓' : fPass === false ? '✗' : ''}
-                    </p>
-                  </div>
+                <div className={`mt-3 grid gap-4 ${gridCols}`}>
+                  {hasBands && (
+                    <>
+                      <div className={`p-3 rounded-lg border ${oPass === true ? 'bg-green-500/10 border-green-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                        <p className="text-xs text-[var(--color-text-secondary)] mb-1">
+                          ΔP_O/Pc band [{(oMin as number).toFixed(3)}, {(oMax as number).toFixed(3)}]
+                        </p>
+                        <p className="font-mono text-sm">
+                          actual: {oRatio !== undefined ? oRatio.toFixed(3) : '—'} {oPass === true ? '✓' : oPass === false ? '✗' : ''}
+                        </p>
+                      </div>
+                      <div className={`p-3 rounded-lg border ${fPass === true ? 'bg-green-500/10 border-green-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                        <p className="text-xs text-[var(--color-text-secondary)] mb-1">
+                          ΔP_F/Pc band [{(fMin as number).toFixed(3)}, {(fMax as number).toFixed(3)}]
+                        </p>
+                        <p className="font-mono text-sm">
+                          actual: {fRatio !== undefined ? fRatio.toFixed(3) : '—'} {fPass === true ? '✓' : fPass === false ? '✗' : ''}
+                        </p>
+                      </div>
+                    </>
+                  )}
+                  {isImpingingResults && (
+                    <div
+                      className={`p-3 rounded-lg border ${
+                        rPass === true
+                          ? 'bg-green-500/10 border-green-500/30'
+                          : 'bg-amber-500/10 border-amber-500/30'
+                      }`}
+                    >
+                      <p className="text-xs text-[var(--color-text-secondary)] mb-1">
+                        Momentum ratio R
+                        {hasRBands ? ` [${(rMin as number).toFixed(3)}, ${(rMax as number).toFixed(3)}]` : ''} · target ~1.000
+                      </p>
+                      <p className="font-mono text-sm">
+                        actual: {rVal !== undefined ? rVal.toFixed(3) : '—'}{' '}
+                        {rPass === true ? '✓' : rPass === false ? '✗' : ''}
+                      </p>
+                      <button
+                        type="button"
+                        className="mt-2 text-xs text-[var(--color-text-secondary)] underline hover:text-[var(--color-text-primary)]"
+                        onClick={() => setMomentumRAuditOpen((o) => !o)}
+                      >
+                        {momentumRAuditOpen ? 'Hide' : 'Show'} R calculation inputs
+                      </button>
+                      {momentumRAuditOpen && (
+                        <dl className="mt-2 space-y-1 text-xs font-mono text-[var(--color-text-secondary)] border-t border-[var(--color-border)] pt-2">
+                          <div className="flex justify-between gap-2">
+                            <dt>ρ_O (momentum)</dt>
+                            <dd>
+                              {typeof perf.rho_O_momentum === 'number'
+                                ? perf.rho_O_momentum.toFixed(3)
+                                : '—'}{' '}
+                              kg/m³
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>ρ_F (momentum)</dt>
+                            <dd>
+                              {typeof perf.rho_F_momentum === 'number'
+                                ? perf.rho_F_momentum.toFixed(3)
+                                : '—'}{' '}
+                              kg/m³
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>v_O_bulk</dt>
+                            <dd>
+                              {typeof perf.v_O_bulk === 'number' ? perf.v_O_bulk.toFixed(4) : '—'} m/s
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>v_F_bulk</dt>
+                            <dd>
+                              {typeof perf.v_F_bulk === 'number' ? perf.v_F_bulk.toFixed(4) : '—'} m/s
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>n_elements O / F</dt>
+                            <dd>
+                              {typeof perf.momentum_ratio_n_elements_O === 'number'
+                                ? perf.momentum_ratio_n_elements_O
+                                : '—'}{' '}
+                              /{' '}
+                              {typeof perf.momentum_ratio_n_elements_F === 'number'
+                                ? perf.momentum_ratio_n_elements_F
+                                : '—'}
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>d_jet O / F</dt>
+                            <dd>
+                              {typeof perf.d_jet_O === 'number'
+                                ? (perf.d_jet_O * 1000).toFixed(4)
+                                : '—'}{' '}
+                              /{' '}
+                              {typeof perf.d_jet_F === 'number'
+                                ? (perf.d_jet_F * 1000).toFixed(4)
+                                : '—'}{' '}
+                              mm
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>A_jet O / F</dt>
+                            <dd>
+                              {typeof perf.A_jet_O === 'number'
+                                ? (perf.A_jet_O * 1e6).toFixed(6)
+                                : '—'}{' '}
+                              /{' '}
+                              {typeof perf.A_jet_F === 'number'
+                                ? (perf.A_jet_F * 1e6).toFixed(6)
+                                : '—'}{' '}
+                              mm²
+                            </dd>
+                          </div>
+                          <div className="pt-1 text-[var(--color-text-secondary)]">
+                            R = √(ρ_O·v_O²/(ρ_F·v_F²)) using bulk jets per stream (mdot/(ρ·n·A_jet)).
+                          </div>
+                        </dl>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })()}
