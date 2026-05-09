@@ -13,7 +13,7 @@ must NOT create or manipulate pressure segments or time arrays.
 
 from __future__ import annotations
 
-from typing import Tuple, Callable, Dict, Any, Optional
+from typing import Tuple, Callable, Dict, Any, Optional, List
 import numpy as np
 import copy
 import logging
@@ -32,6 +32,7 @@ from engine.core.injectors.flow_capacity import (
 from engine.optimizer.injector_dp_penalty import (
     injector_dp_ratio_penalty_weighted,
     injector_dp_ratios_from_eval_result,
+    injector_dp_ratio_within_gate,
 )
 
 from scipy.optimize import minimize, differential_evolution
@@ -57,6 +58,20 @@ from engine.core.chamber_geometry import (
 
 
 TOTAL_WALL_THICKNESS_M = 0.0254  # 1.0 inch total wall (0.5 inch per side: outer - inner diameter)
+
+# Default for ``requirements["min_stability_margin"]`` when unset. MUST stay identical in
+# ``run_layer1_optimization`` and ``_compute_objective_value`` — parallel CMA ranks candidates via
+# workers using the latter; L-BFGS-B uses ``objective()`` on the parent process.
+_LAYER1_DEFAULT_MIN_STABILITY_MARGIN = 1.2
+
+# Fallback injector ΔP/Pc bands when ``constants_dict`` omits keys (must match
+# ``requirements.get("injector_dp_ratio_*")`` defaults in ``run_layer1_optimization``).
+_LAYER1_DEFAULT_DP_O_BAND = (0.15, 0.40)
+_LAYER1_DEFAULT_DP_F_BAND = (0.15, 0.40)
+
+# Fallback when ``layer1_exit_pressure_inside_quad_scale`` is absent from constants (matches
+# ``_requirement_float(..., "layer1_exit_pressure_inside_quad_scale", 0.35)``).
+_LAYER1_DEFAULT_EXIT_PRESSURE_INSIDE_QUAD = 0.35
 
 
 class _LocalSerialExecutor:
@@ -232,6 +247,112 @@ def _impinging_angle_hinge_squared(
         return 0.0
     excess = float(lo - phi) if phi < lo else float(phi - hi)
     return float(excess * excess)
+
+
+def _layer1_exit_pressure_sq_term(
+    P_exit_actual: float,
+    target_P_exit: float,
+    *,
+    deadband_rel: float = 0.05,
+    inside_rel_quad_scale: float = 0.0,
+) -> float:
+    """Exit nozzle vs ambient-equivalent ``target``: asymmetric hinge beyond deadband, optional quad inside.
+
+    Outside ``deadband_rel`` uses the asymmetric hinge used elsewhere; inside the deadband optionally
+    adds ``inside_rel_quad_scale * rel**2`` to gently center on target (preference, not a hard gate).
+    """
+    if target_P_exit <= 0.0 or not np.isfinite(P_exit_actual):
+        return 0.0
+    rel = (float(P_exit_actual) - float(target_P_exit)) / float(target_P_exit)
+    if not np.isfinite(rel):
+        return 0.0
+    deadband_rel = float(max(deadband_rel, 1e-9))
+    if rel < -deadband_rel:
+        excess = rel + deadband_rel
+        return float((5.0 * excess) ** 2)
+    if rel > deadband_rel:
+        excess = rel - deadband_rel
+        return float((1.0 * excess) ** 2)
+    return float(max(0.0, inside_rel_quad_scale)) * float(rel ** 2)
+
+
+def _layer1_primary_relative_metrics(
+    final_performance: Dict[str, Any],
+    *,
+    target_thrust: float,
+    optimal_of: float,
+    target_P_exit: float,
+) -> Dict[str, float]:
+    """Dimensionless thrust / O-F / exit-pressure mismatches (not weighted optimizer penalties).
+
+    The Layer 1 scalar objective multiplies these kinds of errors by ``W_THRUST``, ``W_OF``, ``W_EXIT``
+    (order 1e2–1e4); the weighted sum will never approach machine epsilon. Use these metrics (especially
+    ``rms_primary``) to judge whether the **physics** matches are tight.
+    """
+    try:
+        F = float(final_performance.get("F", float("nan")))
+    except (TypeError, ValueError):
+        F = float("nan")
+    try:
+        MR = float(final_performance.get("MR", float("nan")))
+    except (TypeError, ValueError):
+        MR = float("nan")
+    try:
+        p_ex = float(final_performance.get("P_exit", float("nan")))
+    except (TypeError, ValueError):
+        p_ex = float("nan")
+    rel_thrust = (
+        abs(F - float(target_thrust)) / float(target_thrust)
+        if float(target_thrust) > 0 and np.isfinite(F)
+        else float("nan")
+    )
+    rel_of = (
+        abs(MR - float(optimal_of)) / float(optimal_of)
+        if float(optimal_of) > 0 and np.isfinite(MR)
+        else float("nan")
+    )
+    rel_p_exit = (
+        abs(p_ex - float(target_P_exit)) / float(target_P_exit)
+        if float(target_P_exit) > 0 and np.isfinite(p_ex)
+        else float("nan")
+    )
+    parts = [x for x in (rel_thrust, rel_of, rel_p_exit) if np.isfinite(x)]
+    rms_primary = float(np.sqrt(np.mean(np.square(parts)))) if parts else float("nan")
+    return {
+        "rel_thrust": float(rel_thrust),
+        "rel_of": float(rel_of),
+        "rel_P_exit": float(rel_p_exit),
+        "rms_primary": float(rms_primary),
+    }
+
+
+def _impinging_jet_pair_asymmetry_squared(
+    theta_o_deg: Any,
+    theta_f_deg: Any,
+    *,
+    max_delta_deg: float,
+) -> float:
+    """Soft penalty when paired oxidizer/fuel jet inclinations diverge excessively.
+
+    ``max_delta_deg`` is an allowable |Δθ| band for nominally coherent doublet impingement; excess
+    is normalized by ``max(max_delta_deg, 5 degrees)`` so the term is order one before weights.
+    """
+    if max_delta_deg <= 0.0 or not np.isfinite(max_delta_deg):
+        return 0.0
+    try:
+        t_o = float(theta_o_deg)
+        t_f = float(theta_f_deg)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(t_o) or not np.isfinite(t_f):
+        return 0.0
+    dd = abs(t_o - t_f)
+    cap = float(max_delta_deg)
+    if dd <= cap:
+        return 0.0
+    excess = dd - cap
+    span = float(max(cap, 5.0))
+    return float((excess / span) ** 2)
 
 
 def _relative_hinge_band_squared(v: Any, lo: Optional[float], hi: Optional[float]) -> float:
@@ -451,6 +572,7 @@ def _layer1_final_primary_objective_terms(
     target_thrust: float,
     optimal_of: float,
     target_P_exit: float,
+    layer1_exit_pressure_inside_quad_scale: float = 0.0,
     layer1_w_dp: float,
     layer1_w_dp_o: float,
     layer1_w_dp_f: float,
@@ -493,16 +615,14 @@ def _layer1_final_primary_objective_terms(
     of_contrib = w_of * of_sq
 
     p_exit_actual = float(final_performance.get("P_exit", np.nan))
-    exit_pressure_sq_term = 0.0
-    if target_P_exit > 0 and np.isfinite(p_exit_actual):
-        rel = (p_exit_actual - target_P_exit) / target_P_exit
-        deadband = 0.05
-        if rel < -deadband:
-            excess = rel + deadband
-            exit_pressure_sq_term = float((5.0 * excess) ** 2)
-        elif rel > deadband:
-            excess = rel - deadband
-            exit_pressure_sq_term = float((1.0 * excess) ** 2)
+    exit_pressure_sq_term = float(
+        _layer1_exit_pressure_sq_term(
+            p_exit_actual,
+            float(target_P_exit),
+            deadband_rel=0.05,
+            inside_rel_quad_scale=float(layer1_exit_pressure_inside_quad_scale),
+        )
+    )
     exit_contrib = w_exit * exit_pressure_sq_term
 
     pc = final_performance.get("Pc")
@@ -931,7 +1051,7 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
     max_fuel_P_psi = constants.get('max_fuel_P_psi', 500)
     TOTAL_WALL_THICKNESS_M = constants.get('TOTAL_WALL_THICKNESS_M', 0.0254)
     max_nozzle_exit = constants.get('max_nozzle_exit', 1.0)
-    min_stability = requirements.get('min_stability_margin', 0.15)
+    min_stability = float(requirements.get("min_stability_margin", _LAYER1_DEFAULT_MIN_STABILITY_MARGIN))
 
     A_throat = float(x[0])
     Lstar = float(x[1])
@@ -1108,19 +1228,20 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
         # Failed evaluation gets full penalty
         thrust_penalty_sq_term = 1.0
     
-    # Exit pressure penalty (asymmetric with deadband)
-    exit_pressure_sq_term = 0.0
-    if target_P_exit > 0 and np.isfinite(P_exit_actual):
-        rel = (P_exit_actual - target_P_exit) / target_P_exit
-        deadband = 0.05  # 5%
-        if rel < -deadband:
-            # Overexpanded beyond deadband (worse)
-            excess = rel + deadband
-            exit_pressure_sq_term = (5.0 * excess) ** 2
-        elif rel > deadband:
-            # Underexpanded beyond deadband (less bad)
-            excess = rel - deadband
-            exit_pressure_sq_term = (1.0 * excess) ** 2
+    _ins_q_raw = constants.get("layer1_exit_pressure_inside_quad_scale")
+    exit_pressure_inside_quad_worker = (
+        float(_ins_q_raw)
+        if _ins_q_raw is not None and np.isfinite(float(_ins_q_raw))
+        else _LAYER1_DEFAULT_EXIT_PRESSURE_INSIDE_QUAD
+    )
+    exit_pressure_sq_term = float(
+        _layer1_exit_pressure_sq_term(
+            float(P_exit_actual),
+            float(target_P_exit),
+            deadband_rel=0.05,
+            inside_rel_quad_scale=exit_pressure_inside_quad_worker,
+        )
+    )
     
     # Stability checks
     stability_state = stability.get('stability_state', 'unstable')
@@ -1184,6 +1305,8 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
     L_chamber_curr = L_cylindrical + L_contraction
     if L_chamber_curr <= 0 or not np.isfinite(L_chamber_curr):
         L_chamber_curr = V_chamber / A_chamber_check if A_chamber_check > 0 else 0.2
+    # Keep identical to ``_layer1_apply_chamber_geometry_to_config`` (evaluate/config path).
+    L_chamber_curr = float(np.clip(L_chamber_curr, 0.005, 1.0))
     
     max_chamber_length = float(requirements.get("max_chamber_length_m", 0.50))
     length_term = 0.0
@@ -1222,12 +1345,12 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
     rho_ox_c = float(constants.get("rho_oxidizer", 1140.0))
     rho_fu_c = float(constants.get("rho_fuel", 422.6))
     dp_o_band = (
-        float(constants.get("injector_dp_ratio_O_min", 0.20)),
-        float(constants.get("injector_dp_ratio_O_max", 0.35)),
+        float(constants.get("injector_dp_ratio_O_min", _LAYER1_DEFAULT_DP_O_BAND[0])),
+        float(constants.get("injector_dp_ratio_O_max", _LAYER1_DEFAULT_DP_O_BAND[1])),
     )
     dp_f_band = (
-        float(constants.get("injector_dp_ratio_F_min", 0.15)),
-        float(constants.get("injector_dp_ratio_F_max", 0.35)),
+        float(constants.get("injector_dp_ratio_F_min", _LAYER1_DEFAULT_DP_F_BAND[0])),
+        float(constants.get("injector_dp_ratio_F_max", _LAYER1_DEFAULT_DP_F_BAND[1])),
     )
     _c_sf_raw = constants.get("injector_dp_ratio_O_soft_floor")
     dp_o_soft_floor_worker: Optional[float] = (
@@ -1238,6 +1361,9 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
     W_DP_O_FLOOR_worker = float(constants.get("W_DP_O_FLOOR", 0.0))
     W_SMD = float(constants.get("W_SMD", 0.0))
     W_ANGLE = float(constants.get("W_IMPINGING_ANGLE", 0.0))
+    W_JET_ASYM = float(constants.get("W_IMPINGING_JET_ASYM", 0.0))
+    _jet_asym_mx = constants.get("layer1_impinging_jet_angle_max_asym_deg")
+    jet_asym_max = float(_jet_asym_mx) if _jet_asym_mx is not None else 28.0
     W_CHAMBER_SHAPE = float(constants.get("W_CHAMBER_SHAPE", 2500.0))
     CH_DT_MIN = float(constants.get("layer1_chamber_dt_ratio_min", 2.2))
     CH_DT_MAX = float(constants.get("layer1_chamber_dt_ratio_max", 3.2))
@@ -1253,6 +1379,7 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
 
     momentum_term = 0.0
     angle_term = 0.0
+    jet_asym_term = 0.0
     if inj_type == "impinging" and isinstance(result, dict):
         diagnostics = result.get("diagnostics", {}) if isinstance(result.get("diagnostics"), dict) else {}
         R_val = diagnostics.get("momentum_ratio_R")
@@ -1274,6 +1401,12 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
                 diagnostics.get("impingement_angle_deg"),
                 angle_band_lo_deg=_alo,
                 angle_band_hi_deg=_ahi,
+            )
+        if W_JET_ASYM > 0.0:
+            jet_asym_term = _impinging_jet_pair_asymmetry_squared(
+                ang_O,
+                ang_F,
+                max_delta_deg=jet_asym_max,
             )
     if D_chamber_inner > 0 and D_throat_check > 0:
         chamber_shape_term += _relative_hinge_band_squared(
@@ -1367,6 +1500,7 @@ def _compute_objective_value(result: dict, x: np.ndarray, requirements: dict, co
             W_CHAMBER_SHAPE * chamber_shape_term +
             W_MOM * momentum_term +
             W_ANGLE * angle_term +
+            W_JET_ASYM * jet_asym_term +
             geom_ao_af_weighted +
             W_SMD * smd_term +
             injector_dp_weighted
@@ -1475,6 +1609,115 @@ def _eval_candidate(x_raw):
                 'error_msg': str(e)[:200],
             }
 
+
+def _layer1_cma_warmstart_candidates(
+    x0: np.ndarray,
+    *,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
+    span: np.ndarray,
+    integer_dims: List[int],
+    rng: np.random.Generator,
+    executor: Any,
+    n_trials: int,
+    sigma_frac: float,
+    eval_cache: Dict[Any, Any],
+    make_cache_key_fn: Callable[[np.ndarray], Any],
+    opt_state: Dict[str, Any],
+    logger: logging.Logger,
+) -> Tuple[np.ndarray, float]:
+    """Local cloud around ``x0`` using the **same** ``_eval_candidate`` path as CMA-ES.
+
+    Picks the clipped/snapped vector with lowest scalar objective. This only replaces the
+    CMA initial mean when ``n_trials > 0``; it does not alter ``_compute_objective_value``,
+    validation gates, or final ``evaluate()`` physics.
+    """
+    x0_snap = _snap_integer_dims(
+        np.clip(np.asarray(x0, dtype=float), lower_bounds, upper_bounds),
+        integer_dims,
+    )
+    if n_trials <= 0:
+        return x0_snap.copy(), float("inf")
+
+    n_t = int(max(1, n_trials))
+    candidates: List[np.ndarray] = [x0_snap.copy()]
+    sig = float(max(sigma_frac, 0.0))
+    scale = np.asarray(span, dtype=float)
+    # Multi-ring perturbations (tighter + moderate + wider) to escape ``BASE_INFEAS`` plateau.
+    fracs = (
+        float(max(0.008, 0.45 * sig)),
+        float(sig),
+        float(min(0.22, max(sig * 1.65, sig + 0.02))),
+    )
+    for k in range(n_t - 1):
+        f_k = fracs[k % len(fracs)]
+        noise = rng.standard_normal(len(x0_snap)) * f_k * scale
+        xq = np.clip(x0_snap + noise, lower_bounds, upper_bounds)
+        candidates.append(_snap_integer_dims(xq, integer_dims))
+
+    nw = int(getattr(executor, "_max_workers", 1) or 1)
+    chunksize = max(1, len(candidates) // (nw * 4))
+    results = list(executor.map(_eval_candidate, candidates, chunksize=chunksize))
+
+    best_f = float("inf")
+    best_x = x0_snap.copy()
+    for cand, res in zip(candidates, results):
+        obj_val = float(res["value"])
+        cache_key = make_cache_key_fn(cand)
+        eval_cache[cache_key] = {
+            "value": obj_val,
+            "success": bool(res.get("success", False)),
+        }
+        opt_state["function_evaluations"] = int(opt_state.get("function_evaluations", 0)) + 1
+        _store_last_good_eval_bundle_from_worker_res(res, opt_state)
+        if not res.get("success", True):
+            reason = res.get("error_type", "Unknown")
+            opt_state["num_failures"] = opt_state.get("num_failures", 0) + 1
+            if "fail_counts" not in opt_state:
+                opt_state["fail_counts"] = {}
+            opt_state["fail_counts"][reason] = opt_state["fail_counts"].get(reason, 0) + 1
+        if obj_val < best_f:
+            best_f = obj_val
+            best_x = cand.copy()
+
+    logger.info(
+        "Layer 1 CMA warm-start: %d candidates (sigma_frac=%.4g × span), best objective=%.6g",
+        len(candidates),
+        sigma_frac,
+        best_f,
+    )
+    return best_x, best_f
+
+
+def _layer1_sync_best_from_worker_eval(
+    opt_state: Dict[str, Any],
+    x_vec: np.ndarray,
+    obj_val: float,
+) -> None:
+    """Keep ``best_objective`` / ``best_x`` aligned with parallel ``_eval_candidate`` results."""
+    if not np.isfinite(obj_val):
+        return
+    cur = float(opt_state.get("best_objective", float("inf")))
+    if obj_val < cur:
+        opt_state["best_objective"] = float(obj_val)
+        opt_state["best_x"] = np.asarray(x_vec, dtype=float).copy()
+        opt_state["last_best_eval"] = int(opt_state.get("function_evaluations", 0))
+
+
+def _layer1_emit_objective_plot_point(
+    objective_callback: Optional[Callable[[int, float, float], None]],
+    opt_state: Dict[str, Any],
+    iteration: int,
+    current_obj: float,
+    best_obj: float,
+) -> None:
+    """SSE / UI objective curve (parallel CMA does not call ``objective()``)."""
+    if objective_callback is None:
+        return
+    try:
+        objective_callback(int(iteration), float(current_obj), float(best_obj))
+    except Exception:
+        pass
 
 
 def run_layer1_global_search(
@@ -1687,7 +1930,7 @@ def run_layer1_optimization(
     # Extract requirements
     target_thrust = requirements.get("target_thrust", 7000.0)
     optimal_of = requirements.get("optimal_of_ratio", 2.3)
-    min_stability = requirements.get("min_stability_margin", 1.2)
+    min_stability = float(requirements.get("min_stability_margin", _LAYER1_DEFAULT_MIN_STABILITY_MARGIN))
 
     def _resolve_Lstar_bounds_from_req_and_config() -> Tuple[float, float]:
         """Layer‑1 DOF ``x[1]`` is L* [m]. Prefer ``requirements``; fill missing keys from ``config_obj.design_requirements``."""
@@ -1787,8 +2030,11 @@ def run_layer1_optimization(
     )
     psi_to_Pa = 6894.76
     
-    # Objective tolerance for early stopping
+    # Objective tolerance for early stopping (weighted scalar; see ``primary_relative_residual`` for physics scale)
     obj_tolerance = 2.0  # For good solution: obj ≈ 1.25, so 2.0 is reasonable
+    layer1_lbfgs_gtol = float(max(1e-15, _requirement_float(requirements, "layer1_lbfgs_gtol", 1e-9)))
+    _lbfgs_2 = requirements.get("layer1_lbfgs_second_pass")
+    layer1_lbfgs_second_pass = True if _lbfgs_2 is None else bool(_lbfgs_2)
     
     update_progress("Layer 1: Setup", 0.01, "Initializing Layer 1 optimization...")
     
@@ -2366,6 +2612,13 @@ def run_layer1_optimization(
     layer1_impinging_angle_deg_lo = float(_iang_lo) if _iang_lo is not None else None
     layer1_impinging_angle_deg_hi = float(_iang_hi) if _iang_hi is not None else None
     layer1_W_impinging_angle = _requirement_float(requirements, "W_IMPINGING_ANGLE", 0.0)
+    layer1_W_impinging_jet_asym = _requirement_float(requirements, "W_IMPINGING_JET_ASYM", 160.0)
+    layer1_impinging_jet_max_asym_deg = _requirement_float(
+        requirements, "layer1_impinging_jet_angle_max_asym_deg", 28.0
+    )
+    layer1_exit_pressure_inside_quad = _requirement_float(
+        requirements, "layer1_exit_pressure_inside_quad_scale", 0.35
+    )
     layer1_W_DP = _requirement_float(requirements, "W_DP", 160.0)
     layer1_W_DP_O = (
         float(requirements["W_DP_O"])
@@ -2452,6 +2705,17 @@ def run_layer1_optimization(
             f"[{layer1_impinging_angle_deg_lo:g}, {layer1_impinging_angle_deg_hi:g}] "
             f"with W_IMPINGING_ANGLE={layer1_W_impinging_angle:g}"
         )
+    if l1_injector_type == "impinging" and layer1_W_impinging_jet_asym > 0.0:
+        layer1_logger.info(
+            "Impinging paired jet |Δθ_O/F| soft cap: max Δ=%.2f° with W_IMPINGING_JET_ASYM=%g",
+            float(layer1_impinging_jet_max_asym_deg),
+            float(layer1_W_impinging_jet_asym),
+        )
+    layer1_logger.info(
+        "Ambient-matched exit pressure: inside-deadband quadratic scale "
+        "layer1_exit_pressure_inside_quad_scale=%g (W_EXIT×scale×rel²; 0=flat inside band)",
+        float(layer1_exit_pressure_inside_quad),
+    )
     layer1_logger.info(
         "Layer 1 primary weights: layer1_W_THRUST=%g layer1_W_OF=%g low_MR_scale=%g high_MR_scale=%g; "
         "of_validation_tol=%.4f",
@@ -2680,9 +2944,14 @@ def run_layer1_optimization(
         final_pressures = (P_O_test, P_F_test)
         eval_error_str: Optional[str] = None
         
-        cache_key = _make_eval_cache_key(x_clipped)
+        # During L-BFGS-B refinement, ``objective()`` is called sequentially and needs
+        # exact ``evaluate()`` values for finite-diff gradients — cache quantization can
+        # flatten curvature and inflate residuals. Parallel CMA paths use workers, not this
+        # cache toggle.
+        cache_enabled = not bool(opt_state.get("layer1_lbfgs_phase", False))
+        cache_key = _make_eval_cache_key(x_clipped) if cache_enabled else None
         if infeasibility_score <= 0.0:
-            cached = eval_cache.get(cache_key)
+            cached = eval_cache.get(cache_key) if cache_enabled and cache_key is not None else None
             use_cached = False
             if cached is not None:
                 # Handle both dict format (full cache from objective) and float/dict format (from parallel eval)
@@ -2718,11 +2987,12 @@ def run_layer1_optimization(
                     eval_error_str = str(eval_error)
                     final_results = {}
                 
-                eval_cache[cache_key] = {
-                    "success": bool(eval_success),
-                    "results": copy.deepcopy(final_results) if eval_success else {},
-                    "error": eval_error_str,
-                }
+                if cache_enabled and cache_key is not None:
+                    eval_cache[cache_key] = {
+                        "success": bool(eval_success),
+                        "results": copy.deepcopy(final_results) if eval_success else {},
+                        "error": eval_error_str,
+                    }
         
         # Defaults when evaluation fails / skipped
         F_actual = float(final_results.get("F", np.nan)) if eval_success else np.nan
@@ -2768,20 +3038,15 @@ def run_layer1_optimization(
         # Option A: Deadband + asymmetric quadratic
         P_exit_actual = float(final_results.get("P_exit", np.nan)) if eval_success else np.nan
         
-        exit_pressure_sq_term = 0.0
-        if eval_success and target_P_exit > 0 and np.isfinite(P_exit_actual):
-            rel = (P_exit_actual - target_P_exit) / target_P_exit
-        
-            deadband = 0.05  # 5%
-            if rel < -deadband:
-                # overexpanded beyond deadband
-                excess = rel + deadband
-                exit_pressure_sq_term = (5.0 * excess) ** 2
-            elif rel > deadband:
-                # underexpanded beyond deadband
-                excess = rel - deadband
-                exit_pressure_sq_term = (1.0 * excess) ** 2
-        
+        exit_pressure_sq_term = float(
+            _layer1_exit_pressure_sq_term(
+                float(P_exit_actual) if eval_success else float("nan"),
+                float(target_P_exit),
+                deadband_rel=0.05,
+                inside_rel_quad_scale=float(layer1_exit_pressure_inside_quad),
+            )
+        )
+
         # Injector pressure-drop ratio penalty (ΔP_inj / Pc): piecewise hinge; matches worker _compute_objective_value
         injector_dp_weighted = 0.0
         ratio_o_obj: Optional[float] = None
@@ -2982,6 +3247,7 @@ def run_layer1_optimization(
         momentum_term = 0.0
         smd_term = 0.0
         angle_term = 0.0
+        jet_asym_term = 0.0
         smd_eff_um = float("nan")
         imp_angle_deg = float("nan")
         if has_impinging and eval_success:
@@ -3020,6 +3286,12 @@ def run_layer1_optimization(
                     imp_angle_deg,
                     angle_band_lo_deg=layer1_impinging_angle_deg_lo,
                     angle_band_hi_deg=layer1_impinging_angle_deg_hi,
+                )
+            if layer1_W_impinging_jet_asym > 0.0 and geom is not None:
+                jet_asym_term = _impinging_jet_pair_asymmetry_squared(
+                    getattr(getattr(geom, "oxidizer", None), "impingement_angle", np.nan),
+                    getattr(getattr(geom, "fuel", None), "impingement_angle", np.nan),
+                    max_delta_deg=float(layer1_impinging_jet_max_asym_deg),
                 )
 
         # Geometry hint: A_O/A_F vs MR/√(ρ_O/ρ_F) for R≈1 (soft, optimizer-only)
@@ -3079,6 +3351,7 @@ def run_layer1_optimization(
                 layer1_W_chamber_shape * chamber_shape_term +
                 W_MOM * momentum_term +
                 layer1_W_impinging_angle * angle_term +
+                layer1_W_impinging_jet_asym * jet_asym_term +
                 geom_ao_af_weighted
                 + layer1_W_SMD * smd_term
             )
@@ -3091,10 +3364,12 @@ def run_layer1_optimization(
         of_tol_validation = float(layer1_of_validation_tol)
         # Keep "acceptable" criteria aligned with final validation gates.
         dp_gate_obj = True
-        if ratio_o_obj is not None and np.isfinite(float(ratio_o_obj)):
-            dp_gate_obj &= (layer1_dp_o_band[0] <= ratio_o_obj <= layer1_dp_o_band[1])
-        if ratio_f_obj is not None and np.isfinite(float(ratio_f_obj)):
-            dp_gate_obj &= (layer1_dp_f_band[0] <= ratio_f_obj <= layer1_dp_f_band[1])
+        _ok_o_dp = injector_dp_ratio_within_gate(ratio_o_obj, layer1_dp_o_band[0], layer1_dp_o_band[1])
+        if _ok_o_dp is not None:
+            dp_gate_obj &= bool(_ok_o_dp)
+        _ok_f_dp = injector_dp_ratio_within_gate(ratio_f_obj, layer1_dp_f_band[0], layer1_dp_f_band[1])
+        if _ok_f_dp is not None:
+            dp_gate_obj &= bool(_ok_f_dp)
         momentum_gate_obj = True
         _R_m_gate = np.nan
         if "R_m" in locals() and R_m is not None:
@@ -3289,6 +3564,7 @@ def run_layer1_optimization(
                 "chamber_L_over_D": chamber_ld_ratio_curr,
                 "momentum_balance_penalty": float(W_MOM * momentum_term),
                 "impingement_angle_penalty": float(layer1_W_impinging_angle * angle_term),
+                "jet_angle_asymmetry_penalty": float(layer1_W_impinging_jet_asym * jet_asym_term),
                 "smd_penalty": float(layer1_W_SMD * smd_term),
                 "effective_smd_microns": _finite_or_none(smd_eff_um),
                 "impingement_angle_deg": _finite_or_none(imp_angle_deg),
@@ -3499,6 +3775,9 @@ def run_layer1_optimization(
         'impinging_momentum_R_min': layer1_impinging_R_mom_lo,
         'impinging_momentum_R_max': layer1_impinging_R_mom_hi,
         'W_IMPINGING_ANGLE': layer1_W_impinging_angle,
+        'W_IMPINGING_JET_ASYM': layer1_W_impinging_jet_asym,
+        'layer1_impinging_jet_angle_max_asym_deg': layer1_impinging_jet_max_asym_deg,
+        'layer1_exit_pressure_inside_quad_scale': layer1_exit_pressure_inside_quad,
         'layer1_impinging_angle_deg_min': layer1_impinging_angle_deg_lo,
         'layer1_impinging_angle_deg_max': layer1_impinging_angle_deg_hi,
         'W_CHAMBER_SHAPE': layer1_W_chamber_shape,
@@ -3520,8 +3799,6 @@ def run_layer1_optimization(
         'layer1_W_OF_low_MR_scale': layer1_W_OF_low_MR_scale,
         'layer1_W_OF_high_MR_scale': layer1_W_OF_high_MR_scale,
         'layer1_of_validation_tol': layer1_of_validation_tol,
-        'target_thrust': target_thrust,
-        'optimal_of': optimal_of,
     }
 
     integer_dims = list(layer1_integer_dims)
@@ -3567,6 +3844,48 @@ def run_layer1_optimization(
         if num_workers > 1:
             dummy_candidate = _snap_integer_dims(x0_refined.copy(), integer_dims)
             list(executor.map(_eval_candidate, [dummy_candidate] * num_workers))
+
+        # ------------------------------------------------------------------
+        # CMA warm-start (hybrid + legacy): same ``_eval_candidate`` / objective as CMA
+        # workers. Improves ``x0``; syncs ``opt_state`` + SSE plot (parallel CMA never
+        # calls ``objective()``, so the UI curve used to miss this entirely).
+        # ------------------------------------------------------------------
+        best_x_global = np.asarray(x0_refined, dtype=float).copy()
+        best_f_global = float("inf")
+        layer1_warmstart_applied = False
+        _ws_n_raw = requirements.get("layer1_cma_warmstart_trials")
+        _ws_n = 16 if _ws_n_raw is None else int(_ws_n_raw)
+        if layer1_smoke:
+            _ws_n = min(_ws_n, 4)
+        _ws_sig = _requirement_float(requirements, "layer1_cma_warmstart_sigma_frac", 0.04)
+        if _ws_n > 0:
+            x0_refined, _ws_best_f = _layer1_cma_warmstart_candidates(
+                x0_refined,
+                lower_bounds=lower_bounds,
+                upper_bounds=upper_bounds,
+                span=span,
+                integer_dims=integer_dims,
+                rng=rng,
+                executor=executor,
+                n_trials=_ws_n,
+                sigma_frac=_ws_sig,
+                eval_cache=eval_cache,
+                make_cache_key_fn=_make_eval_cache_key,
+                opt_state=opt_state,
+                logger=layer1_logger,
+            )
+            layer1_warmstart_applied = True
+            best_x_global = np.asarray(x0_refined, dtype=float).copy()
+            if np.isfinite(_ws_best_f):
+                best_f_global = float(_ws_best_f)
+                _layer1_sync_best_from_worker_eval(opt_state, best_x_global, float(_ws_best_f))
+                _layer1_emit_objective_plot_point(
+                    objective_callback,
+                    opt_state,
+                    int(opt_state.get("function_evaluations", 0)),
+                    float(_ws_best_f),
+                    float(opt_state.get("best_objective", _ws_best_f)),
+                )
 
         if effective_mode == "hybrid_cma_blocks" and hasattr(config_obj.optimizer, "hybrid"):
             layer1_logger.info("Using Hybrid CMA + Block Re-optimization mode.")
@@ -3656,11 +3975,10 @@ def run_layer1_optimization(
 
         else:
             # Default/Fallback: Legacy CMA-ES Logic with Parallel Evaluation
-            # (Executor already created above, wrapping both hybrid and default paths)
-            
-            best_x_global = x0_refined
-            best_f_global = float('inf')
-            
+            best_x_global = np.asarray(x0_refined, dtype=float).copy()
+            if not layer1_warmstart_applied:
+                best_f_global = float("inf")
+
             for restart_idx in range(num_restarts):
                 restart_name = f"Restart {restart_idx + 1}/{num_restarts}" if num_restarts > 1 else "Main search"
                 
@@ -3686,6 +4004,11 @@ def run_layer1_optimization(
                 current_sigma0 = float(np.percentile(span, 25) * current_sigma_fraction)
                 if not np.isfinite(current_sigma0) or current_sigma0 <= 0:
                     current_sigma0 = 0.05
+                # First restart only: tighter initial cloud around warm-started ``x0`` so generation-1
+                # samples do not all land in ``BASE_INFEAS`` (~1e6) when global sigma is huge.
+                if restart_idx == 0 and layer1_warmstart_applied:
+                    _s0_scale = _requirement_float(requirements, "layer1_cma_restart0_sigma_scale", 0.48)
+                    current_sigma0 *= float(np.clip(_s0_scale, 0.12, 1.0))
                     
                 current_cma_stds = np.ones_like(span)
                 for i in range(len(span)):
@@ -3838,6 +4161,24 @@ def run_layer1_optimization(
                         # This is correct because CMA-ES needs to update its distribution
                         es.tell(candidates, values)
                         
+                        _fv = [
+                            float(v) if v is not None and np.isfinite(float(v)) else float("inf")
+                            for v in values
+                        ]
+                        if _fv and min(_fv) < float("inf"):
+                            _gen_best = float(min(_fv))
+                            _gi = int(np.argmin(np.asarray(_fv, dtype=float)))
+                            _layer1_sync_best_from_worker_eval(
+                                opt_state, candidates_snapped[_gi], _gen_best
+                            )
+                            _layer1_emit_objective_plot_point(
+                                objective_callback,
+                                opt_state,
+                                int(opt_state.get("function_evaluations", 0)),
+                                _gen_best,
+                                float(opt_state.get("best_objective", _gen_best)),
+                            )
+                        
                         iter_idx = max(1, es.countiter)
                         overall_progress = restart_idx / num_restarts
                         restart_progress = iter_idx / iter_budget / num_restarts
@@ -3886,11 +4227,16 @@ def run_layer1_optimization(
     
     # L-BFGS-B refinement runs after CMA-ES
     # Always run full local optimization regardless of current objective value
-    maxfun_capped = min(max_iterations * 3, 500)
-    
+    # ``minimize(..., ftol=...)`` for L-BFGS-B is **not** a tolerance on Layer 1's
+    # composite objective magnitude. SciPy divides by ``mach_eps`` internally to form
+    # Fortran ``factr`` (see ``scipy.optimize._lbfgsb_py``). Passing ``obj_tolerance*0.1``
+    # (~0.2) made ``factr`` ~ 1e15 → effectively immediate "convergence" with ~1e-4 residuals.
+    maxfun_capped = min(max_iterations * 5, 2500)
+
+    opt_state["layer1_lbfgs_phase"] = True
     update_progress("Layer 1: Local Refinement", 0.47, f"Refining with L-BFGS-B (max {maxfun_capped} func evals)...")
     layer1_logger.info("Phase 2: Local refinement (L-BFGS-B)...")
-    
+
     try:
         lbfgs_result = minimize(
             objective,
@@ -3900,12 +4246,39 @@ def run_layer1_optimization(
             options={
                 'maxiter': max_iterations,
                 'maxfun': maxfun_capped,
-                'ftol': obj_tolerance * 0.1,
-                'gtol': 1e-3,  # Relaxed from 1e-5 to allow larger steps before convergence
-                'maxls': 50,    # Increased from 20 to allow more aggressive line searches
+                # Omitted ftol uses SciPy's default (~``mach_eps`` × 1e7 / ``factr`` workflow).
+                'gtol': layer1_lbfgs_gtol,
+                'maxls': 50,
                 'disp': False,
             }
         )
+        if layer1_lbfgs_second_pass and getattr(lbfgs_result, "success", True):
+            _gt2 = float(max(1e-15, min(1e-12, layer1_lbfgs_gtol * 0.05)))
+            try:
+                lbfgs_result2 = minimize(
+                    objective,
+                    np.asarray(lbfgs_result.x, dtype=float),
+                    method="L-BFGS-B",
+                    bounds=bounds,
+                    options={
+                        "maxiter": max_iterations,
+                        "maxfun": min(800, maxfun_capped),
+                        "gtol": _gt2,
+                        "maxls": 60,
+                        "disp": False,
+                    },
+                )
+                if np.isfinite(getattr(lbfgs_result2, "fun", float("nan"))) and float(lbfgs_result2.fun) <= float(
+                    lbfgs_result.fun
+                ):
+                    lbfgs_result = lbfgs_result2
+                    layer1_logger.info(
+                        "L-BFGS-B second pass improved objective to %.6g (gtol=%.1e)",
+                        float(lbfgs_result.fun),
+                        _gt2,
+                    )
+            except Exception as _e2:
+                layer1_logger.debug("L-BFGS-B second pass skipped: %s", _e2)
         layer1_logger.info("")
         layer1_logger.info("Optimization completed")
         layer1_logger.info(f"Success: {lbfgs_result.success}")
@@ -3926,6 +4299,8 @@ def run_layer1_optimization(
             best_x = opt_state.get('best_x', x0)
             best_obj = opt_state.get('best_objective', float('inf'))
             result = _ResultWrapper(best_x, best_obj)
+    finally:
+        opt_state.pop("layer1_lbfgs_phase", None)
     
     validation_tank_pa: Optional[Tuple[float, float]] = None
     if opt_state["best_config"] is not None:
@@ -4253,13 +4628,9 @@ def run_layer1_optimization(
         lo_o, hi_o = layer1_dp_o_band
         lo_f, hi_f = layer1_dp_f_band
         _oor = False
-        if _ro_p is not None and np.isfinite(float(_ro_p)) and (
-            float(_ro_p) < float(lo_o) or float(_ro_p) > float(hi_o)
-        ):
+        if injector_dp_ratio_within_gate(_ro_p, float(lo_o), float(hi_o)) is False:
             _oor = True
-        if _rf_p is not None and np.isfinite(float(_rf_p)) and (
-            float(_rf_p) < float(lo_f) or float(_rf_p) > float(hi_f)
-        ):
+        if injector_dp_ratio_within_gate(_rf_p, float(lo_f), float(hi_f)) is False:
             _oor = True
         initial_performance["injector_dp_out_of_range"] = bool(_oor)
 
@@ -4402,10 +4773,16 @@ def run_layer1_optimization(
         _ro, _rf = injector_dp_ratios_from_eval_result(pc_val, initial_performance)
         ratio_o_val = _as_finite_float_or_nan(_ro)
         ratio_f_val = _as_finite_float_or_nan(_rf)
-        if np.isfinite(ratio_o_val):
-            dp_gate_passed &= (layer1_dp_o_band[0] <= ratio_o_val <= layer1_dp_o_band[1])
-        if np.isfinite(ratio_f_val):
-            dp_gate_passed &= (layer1_dp_f_band[0] <= ratio_f_val <= layer1_dp_f_band[1])
+        _chk_o_final = injector_dp_ratio_within_gate(
+            ratio_o_val, layer1_dp_o_band[0], layer1_dp_o_band[1]
+        )
+        if _chk_o_final is not None:
+            dp_gate_passed &= bool(_chk_o_final)
+        _chk_f_final = injector_dp_ratio_within_gate(
+            ratio_f_val, layer1_dp_f_band[0], layer1_dp_f_band[1]
+        )
+        if _chk_f_final is not None:
+            dp_gate_passed &= bool(_chk_f_final)
 
     # Impinging momentum-ratio gate (optional).
     momentum_gate_passed = True
@@ -4429,10 +4806,9 @@ def run_layer1_optimization(
         and dp_gate_passed
         and momentum_gate_passed
     )
-    # If final validation gates pass, this run is converged for Layer 1 purposes
-    # even when soft guidance terms (e.g., AO/AF hint) keep residual above obj_tolerance.
-    if pressure_candidate_valid:
-        opt_state["converged"] = True
+    # Surface truth to API/UI: mid-optimization ``converged`` can latch True from soft thresholds;
+    # overrides only when final hard gates settle.
+    opt_state["converged"] = bool(pressure_candidate_valid)
     
     # Build failure reasons
     failure_reasons = []
@@ -4697,6 +5073,12 @@ def run_layer1_optimization(
     except Exception as e:
         layer1_logger.debug(f"Could not calculate effective_injector_area_ratio: {e}")
     
+    _prim_rel = _layer1_primary_relative_metrics(
+        final_performance,
+        target_thrust=target_thrust,
+        optimal_of=optimal_of,
+        target_P_exit=target_P_exit,
+    )
     # Build results dict
     results = {
         "performance": final_performance,
@@ -4711,6 +5093,7 @@ def run_layer1_optimization(
                 if isinstance(opt_state.get("best_objective_breakdown", {}), dict)
                 else {}
             ),
+            "primary_relative_residual": _prim_rel,
         },
         "exit_pressure_targeting": {
             "target_P_exit": target_P_exit,  # Atmospheric pressure from environment config (GPS/GFS-derived)
@@ -4776,6 +5159,7 @@ def run_layer1_optimization(
         target_thrust=target_thrust,
         optimal_of=optimal_of,
         target_P_exit=target_P_exit,
+        layer1_exit_pressure_inside_quad_scale=layer1_exit_pressure_inside_quad,
         layer1_w_dp=layer1_W_DP,
         layer1_w_dp_o=layer1_W_DP_O,
         layer1_w_dp_f=layer1_W_DP_F,
@@ -4804,6 +5188,11 @@ def run_layer1_optimization(
     )
     layer1_logger.info(
         f"  • Injector ΔP penalty contribution: {_primary_terms['injector_dp_penalty_contribution']:.6f}"
+    )
+    layer1_logger.info(
+        "  • Primary relative |ΔF|/F, |ΔMR|/MR, |ΔP_exit|/P_tgt: "
+        f"{_prim_rel['rel_thrust']:.4g}, {_prim_rel['rel_of']:.4g}, {_prim_rel['rel_P_exit']:.4g} "
+        f"(RMS={_prim_rel['rms_primary']:.4g}, dimensionless; not the weighted scalar)"
     )
     if final_performance.get("injector_dp_out_of_range"):
         layer1_logger.warning(

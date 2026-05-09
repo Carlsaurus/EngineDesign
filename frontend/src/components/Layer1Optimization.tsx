@@ -65,6 +65,9 @@ const IMPINGING_BASELINE_DEFAULTS: Record<string, unknown> = {
   W_IMPINGING_ANGLE: 400.0,
   layer1_impinging_angle_deg_min: 55.0,
   layer1_impinging_angle_deg_max: 90.0,
+  W_IMPINGING_JET_ASYM: 180.0,
+  layer1_impinging_jet_angle_max_asym_deg: 26.0,
+  layer1_exit_pressure_inside_quad_scale: 0.38,
   W_SMD: 0.0,
   W_CHAMBER_SHAPE: 2500.0,
   layer1_chamber_dt_ratio_min: 2.2,
@@ -96,6 +99,18 @@ interface Layer1OptimizationProps {
   ) => Promise<{ error?: string; data?: SaveDesignRequirementsResponse }>;
 }
 
+/** Avoid rounding small objectives to "0.000" when magnitude is below ~0.05 (card matches log-scaled convergence plot). */
+function formatLayer1ResidualScalar(best: number): string {
+  if (!Number.isFinite(best)) return String(best);
+  if (best === 0) return '0';
+  const ax = Math.abs(best);
+  if (ax >= 100) return best.toFixed(2);
+  if (ax >= 10) return best.toFixed(3);
+  if (ax >= 0.05) return best.toFixed(4);
+  if (ax >= 1e-4) return best.toExponential(4);
+  return best.toExponential(3);
+}
+
 // Helper component for result cards
 function ResultCard({
   label,
@@ -103,7 +118,8 @@ function ResultCard({
   unit,
   decimals = 2,
   color = 'blue',
-  isText = false
+  isText = false,
+  footnote,
 }: {
   label: string;
   value: number | string | undefined;
@@ -111,6 +127,8 @@ function ResultCard({
   decimals?: number;
   color?: string;
   isText?: boolean;
+  /** Small secondary line (e.g. log10 caption when objective is tiny vs log-scaled chart). */
+  footnote?: string;
 }) {
   const colorClasses: Record<string, string> = {
     blue: 'bg-blue-500/10 border-blue-500/30',
@@ -151,6 +169,9 @@ function ResultCard({
         {displayValue}
         {unit && <span className="text-sm font-normal text-[var(--color-text-secondary)] ml-1">{unit}</span>}
       </p>
+      {footnote ? (
+        <p className="text-[11px] leading-snug mt-1.5 font-mono text-[var(--color-text-secondary)]">{footnote}</p>
+      ) : null}
     </div>
   );
 }
@@ -1171,8 +1192,11 @@ export function Layer1Optimization({
               <div className="grid grid-cols-2 gap-4 mb-3">
                 <ResultCard
                   label="Best Objective (Residual)"
-                  value={results.convergence_info.best_objective}
-                  decimals={3}
+                  value={(() => {
+                    const v = results.convergence_info.best_objective;
+                    return typeof v === 'number' && Number.isFinite(v) ? formatLayer1ResidualScalar(v) : '-';
+                  })()}
+                  isText
                   color={
                     (results.convergence_info.best_objective ?? 0) <= 1
                       ? 'green'
@@ -1180,6 +1204,13 @@ export function Layer1Optimization({
                         ? 'yellow'
                         : 'red'
                   }
+                  footnote={(() => {
+                    const v = results.convergence_info.best_objective;
+                    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+                      return 'Weighted sum of squared penalties (W≈1e2–1e4); not comparable to 1e-14 machine epsilon.';
+                    }
+                    return `Weighted scalar (same as log plot): log10 ≈ ${Math.log10(v).toFixed(3)}. Compare physics RMS below.`;
+                  })()}
                 />
                 <ResultCard
                   label="Converged?"
@@ -1188,6 +1219,59 @@ export function Layer1Optimization({
                   color={results.convergence_info.converged ? 'green' : 'yellow'}
                 />
               </div>
+              {results.convergence_info.primary_relative_residual &&
+                typeof results.convergence_info.primary_relative_residual.rms_primary === 'number' &&
+                Number.isFinite(results.convergence_info.primary_relative_residual.rms_primary) && (
+                  <div className="mb-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-primary)] p-3">
+                    <p className="mb-2 text-xs text-[var(--color-text-secondary)] leading-relaxed">
+                      Primary relative convergence (dimensionless): thrust, O/F, and exit-pressure fractional error.
+                      This is the meaningful “how tight is the match?” metric — not the weighted optimizer scalar above.
+                    </p>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                      <div className="flex justify-between gap-2">
+                        <span className="text-[var(--color-text-secondary)]">|ΔF|/F</span>
+                        <span className="font-mono text-emerald-400">
+                          {(() => {
+                            const x = results.convergence_info.primary_relative_residual?.rel_thrust;
+                            return typeof x === 'number' && Number.isFinite(x)
+                              ? formatLayer1ResidualScalar(x)
+                              : '—';
+                          })()}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span className="text-[var(--color-text-secondary)]">|ΔMR|/MR</span>
+                        <span className="font-mono text-emerald-400">
+                          {(() => {
+                            const x = results.convergence_info.primary_relative_residual?.rel_of;
+                            return typeof x === 'number' && Number.isFinite(x)
+                              ? formatLayer1ResidualScalar(x)
+                              : '—';
+                          })()}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span className="text-[var(--color-text-secondary)]">|ΔP_exit|/P</span>
+                        <span className="font-mono text-emerald-400">
+                          {(() => {
+                            const x = results.convergence_info.primary_relative_residual?.rel_P_exit;
+                            return typeof x === 'number' && Number.isFinite(x)
+                              ? formatLayer1ResidualScalar(x)
+                              : '—';
+                          })()}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2 border-t border-[var(--color-border)] pt-2 md:border-t-0 md:pt-0 md:border-l md:pl-2">
+                        <span className="text-[var(--color-text-secondary)]">RMS (3-way)</span>
+                        <span className="font-mono font-semibold text-[var(--color-text-primary)]">
+                          {formatLayer1ResidualScalar(
+                            results.convergence_info.primary_relative_residual.rms_primary
+                          )}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
               {results.convergence_info.best_objective_breakdown &&
                 Object.keys(results.convergence_info.best_objective_breakdown).length > 0 && (
                   <div className="bg-[var(--color-bg-primary)] border border-[var(--color-border)] rounded-lg p-3">
@@ -1206,7 +1290,7 @@ export function Layer1Optimization({
                         .map(([key, value]) => (
                           <div key={key} className="flex justify-between text-sm">
                             <span className="text-[var(--color-text-secondary)]">{key}</span>
-                            <span className="font-mono text-blue-400">{Number(value).toFixed(3)}</span>
+                            <span className="font-mono text-blue-400">{formatLayer1ResidualScalar(Number(value))}</span>
                           </div>
                         ))}
                     </div>

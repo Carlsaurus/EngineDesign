@@ -797,6 +797,24 @@ export interface Layer1Results {
       actual_pressure_ratio?: number;
       [key: string]: unknown;
     };
+    /** Echo of design_requirements dict consumed by Layer 1 (audit). */
+    layer1_requirements_used?: Record<string, unknown>;
+
+    /** Impinging jet momentum ratio sqrt(rho_O*v_O_bulk²/(rho_F*v_F_bulk²)); ~1 is balanced impingement. */
+    momentum_ratio_R?: number;
+    momentum_balance_penalty?: number;
+    momentum_gate_passed?: boolean;
+    v_O_bulk?: number;
+    v_F_bulk?: number;
+    A_jet_O?: number;
+    A_jet_F?: number;
+    rho_O_momentum?: number;
+    rho_F_momentum?: number;
+    d_jet_O?: number;
+    d_jet_F?: number;
+    momentum_ratio_n_elements_O?: number;
+    momentum_ratio_n_elements_F?: number;
+
     [key: string]: unknown;
   };
   validation: Record<string, unknown>;
@@ -813,6 +831,13 @@ export interface Layer1Results {
     final_change?: number;
     best_objective?: number;
     best_objective_breakdown?: Record<string, unknown>;
+    /** Thrust / O-F / P_exit relative errors and RMS (dimensionless); use for “true” physics convergence. */
+    primary_relative_residual?: {
+      rel_thrust?: number;
+      rel_of?: number;
+      rel_P_exit?: number;
+      rms_primary?: number;
+    };
   };
   config?: EngineConfig;
   config_yaml?: string;

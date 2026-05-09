@@ -7,6 +7,36 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 
+# Layer‑1 injector-face ΔP/Pc gates: tiny edge tolerance so CFD-style float noise /
+# iterative closure residuals do not falsely fail when hinge penalty is (~) zero at the boundary.
+_DEFAULT_INJECTOR_DP_GATE_RTOL = 2.0e-4
+
+
+def injector_dp_ratio_within_gate(
+    r: Optional[float],
+    lo: float,
+    hi: float,
+    *,
+    rtol: float = _DEFAULT_INJECTOR_DP_GATE_RTOL,
+    atol_floor: float = 5.0e-7,
+) -> Optional[bool]:
+    """True if finite ``r`` lies in ``[lo, hi]`` with a small symmetric margin at the edges."""
+    if r is None:
+        return None
+    try:
+        rr = float(r)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(rr):
+        return None
+    lo_f, hi_f = float(lo), float(hi)
+    if hi_f <= lo_f:
+        return False
+    scale_ref = max(abs(lo_f), abs(hi_f), abs(rr), 0.05)
+    margin = max(float(rtol) * scale_ref, float(atol_floor))
+    return (lo_f - margin) <= rr <= (hi_f + margin)
+
+
 def stream_injector_dp_soft_floor_squared(r: Optional[float], floor: Optional[float]) -> float:
     """Squared shortfall when ratio < floor (extra cost for LOX ΔP_inj/Pc too low).
 

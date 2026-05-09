@@ -871,6 +871,32 @@ class DesignRequirementsConfig(BaseModel):
             "(uses layer1_impinging_angle_deg_min/max when both are set)."
         ),
     )
+    # Paired-doublet realism: constrain how far oxidizer vs fuel jet inclinations may diverge.
+    W_IMPINGING_JET_ASYM: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Impinging paired jets only: weight on normalized excess [|θ_O−θ_F| − "
+            "`layer1_impinging_jet_angle_max_asym_deg`]₊ squared (paired-doublet coherence preference)."
+        ),
+    )
+    layer1_impinging_jet_angle_max_asym_deg: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        lt=180.0,
+        description=(
+            "Impinging paired jets only: allowable |θ_O−θ_F| before asymmetry hinge activates [deg]. "
+            "Unset ⇒ optimizer defaults (see layer1_static_optimization)."
+        ),
+    )
+    layer1_exit_pressure_inside_quad_scale: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Inside the nominal plus-or-minus 5 percent exit-pressure deadband, multiply W_EXIT by this "
+            "coefficient times (ΔP_exit/P_tgt) squared to steer toward atmospheric-matched nozzle exit pressure."
+        ),
+    )
     layer1_impinging_n_doublets_max: Optional[int] = Field(
         default=None,
         ge=5,
@@ -886,9 +912,57 @@ class DesignRequirementsConfig(BaseModel):
             "(each restart uses seed + restart_index × 1_000_003). Omit or null → base 42."
         ),
     )
+    layer1_cma_warmstart_trials: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Before legacy CMA-ES, evaluate this many clipped/snapped candidates around ``x0`` "
+            "(same worker objective as CMA). 0 disables. Default 16 in optimizer when unset."
+        ),
+    )
+    layer1_cma_warmstart_sigma_frac: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "Per-dimension Gaussian scale for warm-start perturbations: ``sigma_frac × (upper−lower)``. "
+            "Default 0.04 when unset."
+        ),
+    )
+    layer1_cma_restart0_sigma_scale: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "After warm-start, multiply legacy CMA-ES initial step size (restart 0 only) by this factor "
+            "so the first population stays near the feasible mean (default 0.48 in code when unset)."
+        ),
+    )
+    layer1_lbfgs_gtol: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Gradient norm tolerance for the L-BFGS-B local refinement after CMA-ES (default 1e-9 in code). "
+            "Tighter values can reduce the weighted objective; they do not target a specific absolute objective magnitude."
+        ),
+    )
+    layer1_lbfgs_second_pass: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If true, run a second L-BFGS-B from the first local optimum with a tighter ``gtol`` (default true in code)."
+        ),
+    )
     W_DP: Optional[float] = Field(default=None, ge=0.0, description="Layer 1 fallback injector ΔP weight.")
     W_DP_O: Optional[float] = Field(default=None, ge=0.0, description="Layer 1 oxidizer stream ΔP hinge weight.")
     W_DP_F: Optional[float] = Field(default=None, ge=0.0, description="Layer 1 fuel stream ΔP hinge weight.")
+    W_DP_HIGH: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Layer 1 weight on injector ΔP hinge term when both ΔP/Pc streams exceed their bands "
+            "(used together with W_DP_O/W_DP_F in weighted injector ΔP penalty)."
+        ),
+    )
     layer1_infeasibility_gate_eps: Optional[float] = Field(
         default=None,
         ge=0.0,

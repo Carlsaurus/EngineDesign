@@ -5,6 +5,7 @@ import math
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import logging
 
 import numpy as np
 
@@ -15,13 +16,20 @@ from engine.optimizer.injector_dp_penalty import (
 )
 from engine.optimizer.layers.layer1_static_optimization import (
     TOTAL_WALL_THICKNESS_M,
+    _LAYER1_DEFAULT_DP_F_BAND,
+    _LAYER1_DEFAULT_DP_O_BAND,
+    _LAYER1_DEFAULT_EXIT_PRESSURE_INSIDE_QUAD,
+    _LAYER1_DEFAULT_MIN_STABILITY_MARGIN,
     _compute_objective_value,
     create_layer1_apply_x_to_config,
     run_layer1_optimization,
     _expected_geom_ao_af_for_unit_momentum_ratio,
     _geom_ao_af_momentum_hint_squared,
+    _impinging_jet_pair_asymmetry_squared,
+    _layer1_exit_pressure_sq_term,
     _impinging_momentum_band_violation_squared,
     _impinging_momentum_hinge_squared,
+    _layer1_cma_warmstart_candidates,
     _merge_runner_eval_into_performance,
     _snap_integer_dims,
 )
@@ -445,6 +453,63 @@ class TestLayer1ImpingingVector(unittest.TestCase):
         mr = float(out["MR"])
         self.assertGreater(mf, 0.0)
         self.assertAlmostEqual(mr, mo / mf, places=12)
+
+    def test_cma_warmstart_zero_trials_skips_eval(self):
+        """Warm-start with n_trials=0 must not call the executor (no fake objectives)."""
+        ex = MagicMock()
+        lo = np.zeros(3)
+        hi = np.ones(3)
+        x, f = _layer1_cma_warmstart_candidates(
+            np.array([0.2, 0.5, 0.8]),
+            lower_bounds=lo,
+            upper_bounds=hi,
+            span=hi - lo,
+            integer_dims=[],
+            rng=np.random.default_rng(0),
+            executor=ex,
+            n_trials=0,
+            sigma_frac=0.04,
+            eval_cache={},
+            make_cache_key_fn=lambda a: tuple(np.round(a, 6)),
+            opt_state={"function_evaluations": 0},
+            logger=logging.getLogger("test"),
+        )
+        ex.map.assert_not_called()
+        self.assertTrue(np.all(x >= lo) and np.all(x <= hi))
+        self.assertTrue(np.isinf(f))
+
+    def test_min_stability_margin_default_worker_parent_aligned(self):
+        """Parallel workers score candidates with ``_compute_objective_value``; parent uses ``objective()``."""
+        self.assertEqual(_LAYER1_DEFAULT_MIN_STABILITY_MARGIN, 1.2)
+        self.assertEqual(_LAYER1_DEFAULT_DP_O_BAND, (0.15, 0.40))
+        self.assertEqual(_LAYER1_DEFAULT_DP_F_BAND, (0.15, 0.40))
+        self.assertEqual(_LAYER1_DEFAULT_EXIT_PRESSURE_INSIDE_QUAD, 0.35)
+
+    def test_exit_pressure_inside_band_quad_scale(self):
+        """Inside-rel quad steers toward P_target without changing the hinge outside the deadband."""
+        target = 100_000.0
+        flat = _layer1_exit_pressure_sq_term(103_000.0, target, inside_rel_quad_scale=0.0)
+        self.assertAlmostEqual(flat, 0.0, places=15)
+        rel = 0.03
+        q = _layer1_exit_pressure_sq_term((1.0 + rel) * target, target, inside_rel_quad_scale=2.0)
+        self.assertAlmostEqual(q, 2.0 * rel * rel)
+        outs = _layer1_exit_pressure_sq_term(113_000.0, target, inside_rel_quad_scale=0.0)
+        self.assertAlmostEqual(outs, 0.08**2)
+
+    def test_impinging_jet_pair_asymmetry_squared(self):
+        self.assertAlmostEqual(
+            _impinging_jet_pair_asymmetry_squared(45.0, 45.0, max_delta_deg=26.0),
+            0.0,
+        )
+        dd = abs(62.43 - 16.79)
+        excess = dd - 26.0
+        span = max(26.0, 5.0)
+        self.assertAlmostEqual(
+            _impinging_jet_pair_asymmetry_squared(62.43, 16.79, max_delta_deg=26.0),
+            (excess / span) ** 2,
+            places=12,
+        )
+        self.assertAlmostEqual(_impinging_jet_pair_asymmetry_squared(17.0, 42.0, max_delta_deg=28.0), 0.0)
 
 
 if __name__ == "__main__":

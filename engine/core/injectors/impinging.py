@@ -43,6 +43,31 @@ from engine.core.injectors.flow_capacity import (
 )
 
 
+def momentum_ratio_R_from_bulk_velocities(
+    rho_O: float,
+    rho_F: float,
+    v_O_bulk: float,
+    v_F_bulk: float,
+) -> float:
+    """Jet momentum ratio used by Layer 1: sqrt(rho_O*v_O^2 / (rho_F*v_F^2)).
+
+    ``v_*_bulk`` are bulk speeds per stream: mdot / (rho * n_elements * A_jet).
+    """
+    if (
+        rho_O <= 0
+        or rho_F <= 0
+        or not np.isfinite(v_O_bulk)
+        or not np.isfinite(v_F_bulk)
+        or v_F_bulk == 0.0
+    ):
+        return float("nan")
+    num_mom = rho_O * v_O_bulk ** 2
+    den_mom = rho_F * v_F_bulk ** 2
+    if den_mom <= 0 or num_mom < 0:
+        return float("nan")
+    return float(np.sqrt(num_mom / den_mom))
+
+
 class ImpingingInjector(InjectorModel):
     """Twin-jet impinging injector solver."""
 
@@ -509,20 +534,26 @@ class ImpingingInjector(InjectorModel):
         denom_F = rho_F * float(n_F) * A_jet_F
         v_O_bulk = mdot_O / denom_O if denom_O > 0 else np.nan
         v_F_bulk = mdot_F / denom_F if denom_F > 0 else np.nan
-        momentum_ratio_R = np.nan
-        if (
-            rho_O > 0
-            and rho_F > 0
-            and np.isfinite(v_O_bulk)
-            and np.isfinite(v_F_bulk)
-            and v_F_bulk != 0.0
-        ):
-            num_mom = rho_O * v_O_bulk ** 2
-            den_mom = rho_F * v_F_bulk ** 2
-            if den_mom > 0 and num_mom >= 0:
-                momentum_ratio_R = float(np.sqrt(num_mom / den_mom))
+        momentum_ratio_R = momentum_ratio_R_from_bulk_velocities(
+            float(rho_O), float(rho_F), float(v_O_bulk), float(v_F_bulk)
+        )
 
-        mom_update: Dict[str, Any] = {}
+        mom_update: Dict[str, Any] = {
+            "A_jet_O": float(A_jet_O),
+            "A_jet_F": float(A_jet_F),
+            "momentum_ratio_n_elements_O": int(n_O),
+            "momentum_ratio_n_elements_F": int(n_F),
+            "d_jet_O": float(djo),
+            "d_jet_F": float(djf),
+        }
+        if np.isfinite(v_O_bulk):
+            mom_update["v_O_bulk"] = float(v_O_bulk)
+        if np.isfinite(v_F_bulk):
+            mom_update["v_F_bulk"] = float(v_F_bulk)
+        if rho_O > 0:
+            mom_update["rho_O_momentum"] = float(rho_O)
+        if rho_F > 0:
+            mom_update["rho_F_momentum"] = float(rho_F)
         if np.isfinite(momentum_ratio_R) and momentum_ratio_R > 0:
             mom_update["momentum_ratio_R"] = momentum_ratio_R
 

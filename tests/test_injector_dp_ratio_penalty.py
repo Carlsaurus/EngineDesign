@@ -5,6 +5,7 @@ import unittest
 from engine.optimizer.injector_dp_penalty import (
     injector_dp_ratio_penalty_weighted,
     injector_dp_ratios_from_eval_result,
+    injector_dp_ratio_within_gate,
     stream_injector_dp_band_hinge_squared,
     stream_injector_dp_raw_terms,
     stream_injector_dp_soft_floor_squared,
@@ -100,7 +101,9 @@ class TestInjectorDpRatioPenalty(unittest.TestCase):
 
     def test_deprecated_raw_terms_matches_lox_band(self):
         d, h = stream_injector_dp_raw_terms(0.40)
-        self.assertAlmostEqual(d, (0.40 - 0.35) ** 2, places=12)
+        span = 0.35 - 0.20
+        expected = ((0.40 - 0.35) / span) ** 2
+        self.assertAlmostEqual(d, expected, places=12)
         self.assertAlmostEqual(h, 0.0, places=12)
 
     def test_ratios_from_eval_result_prefers_delta_p(self):
@@ -120,6 +123,16 @@ class TestInjectorDpRatioPenalty(unittest.TestCase):
         ro, rf = injector_dp_ratios_from_eval_result(pc, res)
         self.assertAlmostEqual(ro, 0.4)
         self.assertAlmostEqual(rf, 0.35)
+
+    def test_ratio_within_gate_allows_micro_creep_above_upper_edge(self):
+        """Closure noise can yield ΔP/Pc ≡ hi plus float dust; hinge is ~zero but plain ``<= hi`` can fail."""
+        lo, hi = 0.15, 0.35
+        self.assertTrue(injector_dp_ratio_within_gate(0.35, lo, hi))
+        creep = hi + 3.0e-5
+        self.assertTrue(injector_dp_ratio_within_gate(creep, lo, hi))
+        far = hi + 0.02
+        self.assertFalse(injector_dp_ratio_within_gate(far, lo, hi))
+        self.assertIsNone(injector_dp_ratio_within_gate(None, lo, hi))
 
 
 if __name__ == "__main__":

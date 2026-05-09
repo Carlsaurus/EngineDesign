@@ -409,8 +409,21 @@ design_requirements:
   layer1_impinging_angle_deg_min: 55.0
   layer1_impinging_angle_deg_max: 90.0
   W_IMPINGING_ANGLE: 400.0
+  # Prefer coherent paired doublets (engineering preference; does not widen validation gates).
+  W_IMPINGING_JET_ASYM: 180.0
+  layer1_impinging_jet_angle_max_asym_deg: 26.0
+  # Mild preference to center P_exit on P_amb inside the hinge deadband (0 = legacy flat plateau).
+  layer1_exit_pressure_inside_quad_scale: 0.38
   layer1_impinging_n_doublets_max: 20
   layer1_random_seed: null
+  # Real ``evaluate()`` + same scalar as CMA workers; only improves initial mean (0 = off).
+  layer1_cma_warmstart_trials: 16
+  layer1_cma_warmstart_sigma_frac: 0.04
+  # Tighten CMA step size on first restart only after warm-start (reduces 1e6 first-generation wall).
+  layer1_cma_restart0_sigma_scale: 0.48
+  # Local polish after CMA-ES: tighter than legacy 1e-6; optional second pass nudges weighted obj further.
+  layer1_lbfgs_gtol: 1.0e-9
+  layer1_lbfgs_second_pass: true
   W_DP: 500.0
   W_DP_O: 1000.0
   W_DP_F: 1000.0
